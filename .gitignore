@@ -1,0 +1,26 @@
+# Dependencies and generated output
+node_modules/
+dist/
+coverage/
+.vite/
+playwright-report/
+test-results/
+*.tgz
+
+# Local configuration
+.env
+.env.*
+!.env.example
+
+# Runtime data
+*.log
+*.pid
+*.sock
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.agent-memory-share-mcp/
+
+# Operating-system files
+.DS_Store
+Thumbs.db

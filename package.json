@@ -1,0 +1,69 @@
+{
+  "name": "agent-memory-share-mcp",
+  "version": "0.0.0",
+  "description": "Local-first MCP search service for coding-agent sessions and memories.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "agent-memory": "./dist/cli/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "clean": "node scripts/clean.mjs",
+    "dev": "concurrently -k -n server,web \"npm:dev:server\" \"npm:dev:web\"",
+    "dev:server": "tsx watch src/cli/index.ts serve --host 127.0.0.1 --port 43110",
+    "dev:web": "vite",
+    "build": "npm run clean && tsc -p tsconfig.build.json && vite build",
+    "prepack": "npm run build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "start": "node dist/cli/index.js serve"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@fastify/static": "^10.1.6",
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "@radix-ui/react-slot": "^1.5.0",
+    "@tanstack/react-query": "^5.104.2",
+    "better-sqlite3": "^13.0.3",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "commander": "^15.0.0",
+    "fastify": "^5.12.7",
+    "lucide-react": "^1.57.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "react-router-dom": "^7.18.4",
+    "tailwind-merge": "^3.7.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.64.1",
+    "@tailwindcss/vite": "^4.3.3",
+    "@testing-library/jest-dom": "^7.0.1",
+    "@testing-library/react": "^16.3.3",
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^26.6.5",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "@vitest/coverage-v8": "^5.0.4",
+    "concurrently": "^10.0.6",
+    "jsdom": "^30.1.2",
+    "tailwindcss": "^4.3.3",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.4",
+    "vitest": "^5.0.4"
+  }
+}
