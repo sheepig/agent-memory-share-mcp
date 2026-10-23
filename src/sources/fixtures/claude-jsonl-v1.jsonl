@@ -1,0 +1,2 @@
+{"uuid":"claude-user-event","timestamp":"2026-01-01T00:00:00.000Z","type":"user","sessionId":"fixture-claude","cwd":"/fixture/claude","message":{"role":"user","content":"Synthetic Claude compatibility request"}}
+{"uuid":"claude-assistant-event","timestamp":"2026-01-01T00:01:00.000Z","type":"assistant","sessionId":"fixture-claude","message":{"role":"assistant","content":"Synthetic final answer with sufficient visible detail for compatibility verification and deterministic indexing behavior."}}

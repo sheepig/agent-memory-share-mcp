@@ -1,0 +1,7 @@
+{
+  "session": { "id": "fixture-opencode", "title": "Synthetic OpenCode fixture", "directory": "/fixture/opencode", "timeUpdated": 1767225660000 },
+  "messages": [
+    { "id": "fixture-user", "role": "user", "timeCreated": 1767225600000, "text": "Synthetic OpenCode compatibility request" },
+    { "id": "fixture-assistant", "role": "assistant", "timeCreated": 1767225660000, "text": "Synthetic final answer with sufficient visible detail for compatibility verification and deterministic indexing behavior." }
+  ]
+}

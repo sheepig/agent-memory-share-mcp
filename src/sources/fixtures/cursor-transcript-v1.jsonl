@@ -1,0 +1,2 @@
+{"timestamp":"2026-01-01T00:00:00.000Z","role":"user","message":{"content":"Synthetic Cursor compatibility request"}}
+{"timestamp":"2026-01-01T00:01:00.000Z","role":"assistant","message":{"content":"Synthetic final answer with sufficient visible detail for compatibility verification and deterministic indexing behavior."}}

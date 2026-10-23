@@ -2,12 +2,13 @@ import { Database, FolderClock, Search } from "lucide-react";
 import { Navigate, NavLink, Route, Routes } from "react-router-dom";
 
 import { cn } from "./lib/utils.js";
-import { MemoriesPage } from "./pages/memories-page.js";
+import { SearchPage } from "./pages/search-page.js";
+import { SessionDetailPage } from "./pages/session-detail-page.js";
 import { SessionsPage } from "./pages/sessions-page.js";
 
 const navigation = [
   { icon: FolderClock, label: "Sessions", to: "/sessions" },
-  { icon: Search, label: "Memories", to: "/memories" },
+  { icon: Search, label: "Search", to: "/search" },
 ] as const;
 
 export function App() {
@@ -37,7 +38,9 @@ export function App() {
         <Routes>
           <Route element={<Navigate replace to="/sessions" />} path="/" />
           <Route element={<SessionsPage />} path="/sessions" />
-          <Route element={<MemoriesPage />} path="/memories" />
+          <Route element={<SessionDetailPage />} path="/sessions/:candidateId" />
+          <Route element={<SearchPage />} path="/search" />
+          <Route element={<Navigate replace to="/search" />} path="/memories" />
         </Routes>
       </main>
     </div>

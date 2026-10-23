@@ -1,11 +1,15 @@
 # Dependencies and generated output
 node_modules/
 dist/
-coverage/
 .vite/
-playwright-report/
-test-results/
 *.tgz
+
+# Test artifacts (keep test sources and synthetic fixtures tracked)
+coverage/
+test-results/
+playwright-report/
+blob-report/
+playwright/.cache/
 
 # Local configuration
 .env
@@ -19,6 +23,8 @@ test-results/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+
+# Local runtime, verification, evaluation data, and model caches
 .agent-memory-share-mcp/
 
 # Operating-system files

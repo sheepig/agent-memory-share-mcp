@@ -1,12 +1,19 @@
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { FastifyInstance } from "fastify";
 
-import { createMcpServer } from "./create-server.js";
+import { createInProcessMcpBackend, createMcpServer } from "./create-server.js";
+import type { SourceService } from "../application/source-service.js";
+import type { SourceWorker } from "../server/source-worker.js";
 import type { AppDatabase } from "../storage/database.js";
 
-export function registerMcpHttp(app: FastifyInstance, database: AppDatabase): void {
+export function registerMcpHttp(
+  app: FastifyInstance,
+  database: AppDatabase,
+  sources: SourceService,
+  worker: SourceWorker,
+): void {
   app.post("/mcp", async (request, reply) => {
-    const server = createMcpServer(database);
+    const server = createMcpServer(createInProcessMcpBackend(database, sources, worker));
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
     });

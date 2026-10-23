@@ -1,0 +1,9 @@
+{
+  "fixturePolicy": "synthetic",
+  "formats": [
+    { "agent": "codex", "fixture": "codex-jsonl-v1.jsonl", "format": "jsonl-v1" },
+    { "agent": "claude-code", "fixture": "claude-jsonl-v1.jsonl", "format": "jsonl-v1" },
+    { "agent": "cursor", "fixture": "cursor-transcript-v1.jsonl", "format": "transcript-v1" },
+    { "agent": "opencode", "fixture": "opencode-sqlite-v1.json", "format": "sqlite-v1" }
+  ]
+}

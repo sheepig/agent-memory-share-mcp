@@ -1,6 +1,6 @@
 {
   "name": "agent-memory-share-mcp",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Local-first MCP search service for coding-agent sessions and memories.",
   "license": "MIT",
   "type": "module",
@@ -9,6 +9,7 @@
   },
   "files": [
     "dist",
+    "docs",
     "README.md",
     "LICENSE"
   ],
@@ -24,6 +25,7 @@
     "prepack": "npm run build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:e2e": "npm run build && playwright test e2e/web.spec.ts",
     "test:watch": "vitest",
     "start": "node dist/cli/index.js serve"
   },
@@ -32,6 +34,7 @@
   },
   "dependencies": {
     "@fastify/static": "^10.1.6",
+    "@huggingface/transformers": "^4.3.1",
     "@modelcontextprotocol/sdk": "^1.32.1",
     "@radix-ui/react-slot": "^1.5.0",
     "@tanstack/react-query": "^5.104.2",
@@ -40,7 +43,10 @@
     "clsx": "^2.1.1",
     "commander": "^15.0.0",
     "fastify": "^5.12.7",
+    "hyparquet": "^1.31.4",
     "lucide-react": "^1.57.0",
+    "openai": "^7.36.0",
+    "pino": "^10.4.0",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
     "react-router-dom": "^7.18.4",
