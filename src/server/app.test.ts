@@ -27,6 +27,47 @@ afterEach(async () => {
 });
 
 describe("server", () => {
+  it("serves health while the initial background scan is waiting for embeddings", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "agent-memory-startup-test-"));
+    temporaryDirectories.push(root);
+    const homeDirectory = path.join(root, "home");
+    const memoryPath = path.join(homeDirectory, ".codex/memories/MEMORY.md");
+    await fs.mkdir(path.dirname(memoryPath), { recursive: true });
+    await fs.writeFile(memoryPath, "# Startup evidence\nKeep the service available while the local embedding model loads.");
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    const building = buildServer({
+      backgroundInitialScan: true,
+      dataDirectory: path.join(root, "data"),
+      embeddingProvider: {
+        ...embeddingProvider,
+        async embedPassages(texts) {
+          await pending;
+          return texts.map(() => Float32Array.from([1, 0]));
+        },
+      },
+      homeDirectory,
+      logger: false,
+      scanIntervalMs: 0,
+    });
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const app = await Promise.race([
+        building,
+        new Promise<never>((_resolve, reject) => {
+          timeout = setTimeout(() => reject(new Error("Server startup blocked on initial embeddings.")), 2_000);
+        }),
+      ]);
+      await app.listen({ host: "127.0.0.1", port: 0 });
+      expect((await app.inject({ method: "GET", url: "/api/health" })).statusCode).toBe(200);
+      expect((await app.inject({ method: "GET", url: "/api/scan/status" })).json().state).toBe("scanning");
+    } finally {
+      clearTimeout(timeout);
+      release();
+      await (await building).close();
+    }
+  });
+
   it("reports service and database health", async () => {
     const dataDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "agent-memory-test-"));
     temporaryDirectories.push(dataDirectory);
@@ -114,6 +155,42 @@ describe("server", () => {
     expect(logs).not.toContain("credential-like-private-query");
   });
 
+  it("filters both memories and sessions by excluded agent and validates the enum", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "agent-memory-exclude-agent-"));
+    temporaryDirectories.push(root);
+    const homeDirectory = path.join(root, "home");
+    const memoryPath = path.join(homeDirectory, ".codex/memories/MEMORY.md");
+    const sessionPath = path.join(homeDirectory, ".codex/sessions/session.jsonl");
+    await fs.mkdir(path.dirname(memoryPath), { recursive: true });
+    await fs.mkdir(path.dirname(sessionPath), { recursive: true });
+    await fs.writeFile(memoryPath, "# Evidence\nSynthetic searchable evidence in a memory.");
+    await fs.writeFile(sessionPath, [
+      { type: "session_meta", payload: { id: "exclude-agent-session" } },
+      { type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "Find searchable evidence" }] } },
+      { type: "response_item", payload: { type: "message", role: "assistant", phase: "final_answer", content: [{ type: "output_text", text: visibleFinalAnswer }] } },
+    ].map((record) => JSON.stringify(record)).join("\n"));
+    const app = await buildServer({
+      dataDirectory: path.join(root, "data"), embeddingProvider, homeDirectory, logger: false, scanIntervalMs: 0,
+    });
+    try {
+      const listed = await app.inject({ method: "GET", url: "/api/sessions" });
+      const candidateId = listed.json<{ sessions: Array<{ candidateId: string }> }>().sessions[0]!.candidateId;
+      expect((await app.inject({ method: "POST", url: `/api/sessions/${candidateId}/index` })).statusCode).toBe(200);
+      for (const mode of ["keyword", "semantic", "hybrid"]) {
+        for (const excludeAgent of ["claude-code", "codex", "cursor", "opencode"]) {
+          const result = await app.inject({ method: "GET", url: `/api/search?query=evidence&mode=${mode}&excludeAgent=${excludeAgent}` });
+          expect(result.statusCode).toBe(200);
+          expect(result.json().results).toHaveLength(excludeAgent === "codex" ? 0 : 2);
+        }
+      }
+      for (const excludeAgent of ["claude", "CODEX", "unknown", ""]) {
+        expect((await app.inject({ method: "GET", url: `/api/search?query=evidence&excludeAgent=${excludeAgent}` })).statusCode).toBe(400);
+      }
+    } finally {
+      await app.close();
+    }
+  });
+
   it("exposes the session selection and search use cases to the web client", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "agent-memory-api-test-"));
     temporaryDirectories.push(root);
@@ -138,7 +215,7 @@ describe("server", () => {
     expect(initialStatus.json<{ runCount: number; state: string }>()).toMatchObject({ runCount: 1, state: "idle" });
     const listed = await app.inject({ method: "GET", url: "/api/sessions" });
     expect(listed.statusCode).toBe(200);
-    expect(listed.json<{ counts: Record<string, number> }>().counts).toEqual({ discovered: 1, excluded: 0, selected: 0 });
+    expect(listed.json<{ counts: Record<string, number> }>().counts).toEqual({ discovered: 0, excluded: 0, selected: 1 });
     const candidateId = listed.json<{ sessions: Array<{ candidateId: string }> }>().sessions[0]?.candidateId;
     expect(candidateId).toHaveLength(64);
     const conversation = await app.inject({ method: "GET", url: `/api/sessions/${candidateId}` });
@@ -150,7 +227,7 @@ describe("server", () => {
     expect(conversation.body).not.toContain("hidden reasoning");
     expect((await app.inject({ method: "GET", url: `/api/sessions/${"0".repeat(64)}` })).statusCode).toBe(404);
     const beforeIndexSearch = await app.inject({ method: "GET", url: "/api/search?query=searchable%20evidence&sourceType=session" });
-    expect(beforeIndexSearch.json<{ results: unknown[] }>().results).toHaveLength(0);
+    expect(beforeIndexSearch.json<{ results: unknown[] }>().results).toHaveLength(1);
     const statusAfterReads = await app.inject({ method: "GET", url: "/api/scan/status" });
     expect(statusAfterReads.json<{ runCount: number }>().runCount).toBe(1);
     const missing = await app.inject({ method: "POST", url: `/api/sessions/${"0".repeat(64)}/index` });
@@ -193,7 +270,7 @@ describe("server", () => {
     const manualScan = await app.inject({ method: "POST", url: "/api/scan" });
     expect(manualScan.statusCode).toBe(200);
     const finalStatus = await app.inject({ method: "GET", url: "/api/scan/status" });
-    expect(finalStatus.json<{ runCount: number }>().runCount).toBe(6);
+    expect(finalStatus.json<{ runCount: number }>().runCount).toBeGreaterThan(statusAfterReads.json<{ runCount: number }>().runCount);
     expect((await app.inject({ method: "GET", url: `/api/diagnostics?sourceId=${candidateId}` })).statusCode).toBe(200);
     expect((await app.inject({ method: "GET", url: "/api/index/status" })).json()).toMatchObject({
       embedding: { indexed: 1 },

@@ -50,6 +50,7 @@
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
     "react-router-dom": "^7.18.4",
+    "rotating-file-stream": "3.2.10",
     "tailwind-merge": "^3.7.0",
     "zod": "^4.6.7"
   },

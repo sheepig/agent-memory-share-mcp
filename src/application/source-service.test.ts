@@ -115,7 +115,7 @@ describe("source service", () => {
 
     expect(result.sessions.map((session) => session.agent).sort()).toEqual(["claude-code", "codex", "cursor", "opencode"]);
     expect(JSON.stringify(result)).not.toContain("child");
-    expect(result.sessions.every((session) => session.disposition === "discovered")).toBe(true);
+    expect(result.sessions.every((session) => session.disposition === "selected")).toBe(true);
     expect(result.sessions.find((session) => session.agent === "codex")).toMatchObject({
       projectPath: "/project/from-state",
       title: "Saved Codex title",
@@ -210,11 +210,14 @@ describe("source service", () => {
       }) }] } },
     ]);
     await service.scanSources();
-    expect((await service.listSessions({ limit: 20, offset: 0 })).sessions).toHaveLength(0);
+    expect((await service.listSessions({ limit: 20, offset: 0 })).sessions).toEqual([
+      expect.objectContaining({ sessionId: "ordinary-json", indexStatus: "source_unavailable" }),
+    ]);
+    expect((await service.searchFragments({ query: "feature", limit: 20, sourceType: "session" })).results).toHaveLength(0);
     database.close();
   });
 
-  it("auto-indexes memory but indexes a session only after explicit selection", async () => {
+  it("auto-indexes memory and sessions while keeping explicit indexing idempotent", async () => {
     const { database, homeDirectory } = await makeWorkspace();
     const sessionPath = path.join(homeDirectory, ".codex/sessions/2026/10/14/session.jsonl");
     await writeJsonl(sessionPath, [
@@ -241,7 +244,7 @@ describe("source service", () => {
     const service = createSourceService(database, { embeddingProvider, homeDirectory });
     await service.scanSources();
     const before = await service.searchFragments({ limit: 20, query: "会话搜索" });
-    expect(before.results).toHaveLength(0);
+    expect(before.results).toHaveLength(1);
     const memory = await service.searchFragments({ limit: 20, query: "数据库迁移", sourceType: "memory" });
     expect(memory.results).toHaveLength(1);
     expect(memory.results[0]?.sourcePath).toBe(memoryPath);
@@ -260,7 +263,7 @@ describe("source service", () => {
     const candidate = sessions.sessions.find((session) => session.sessionId === "codex-search");
     expect(candidate).toBeDefined();
     const conversation = await service.getSessionConversation(candidate!.candidateId);
-    expect(conversation.session.disposition).toBe("discovered");
+    expect(conversation.session.disposition).toBe("selected");
     expect(conversation.messages).toEqual([
       { body: "实现准确的跨会话搜索功能", location: "line:4", role: "user" },
       { body: SEARCH_ASSISTANT_REPLY, location: "line:6", role: "assistant" },
@@ -287,7 +290,7 @@ describe("source service", () => {
       projectPath: "/project/search",
       sourcePath: sessionPath,
       sourceType: "session",
-      title: "display-title-only-marker",
+      title: "实现准确的跨会话搜索功能",
       turnCount: 1,
     });
     expect(result.results[0]?.chunkIndex).toBe(0);
@@ -599,6 +602,9 @@ describe("source service", () => {
       { type: "user", sessionId: "valid", message: { role: "user", content: "Retain valid records for indexing" } },
       { type: "assistant", sessionId: "valid", message: { role: "assistant", content: DISCOVERY_ASSISTANT_REPLY } },
     ]);
+    await service.scanSources();
+    expect(service.listDiagnostics({ limit: 20 }).diagnostics.find((diagnostic) => diagnostic.code === "malformed_jsonl_records"))
+      .toMatchObject({ occurrenceCount: 2, resolvedAt: expect.any(String) });
     await service.scanSources();
     expect(service.listDiagnostics({ limit: 20 }).diagnostics.find((diagnostic) => diagnostic.code === "malformed_jsonl_records"))
       .toMatchObject({ occurrenceCount: 2, resolvedAt: expect.any(String) });

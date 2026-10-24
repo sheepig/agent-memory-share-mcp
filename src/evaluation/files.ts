@@ -17,7 +17,26 @@ export async function readCandidatePool(file: string): Promise<CandidatePool> {
 }
 
 export async function readEvaluationConfig(file: string): Promise<EvaluationConfig> {
-  return evaluationConfigSchema.parse(JSON.parse(await fs.readFile(file, "utf8")));
+  const value = JSON.parse(await fs.readFile(file, "utf8"));
+  if (!value || typeof value !== "object" || Array.isArray(value)) return evaluationConfigSchema.parse(value);
+  const root = path.dirname(path.resolve(file));
+  function resolveField(object: Record<string, unknown> | undefined, key: string): void {
+    if (object && typeof object[key] === "string") object[key] = path.resolve(root, object[key]);
+  }
+  resolveField(value, "outputDirectory");
+  for (const dataset of Array.isArray(value.datasets) ? value.datasets : []) {
+    if (!dataset || typeof dataset !== "object") continue;
+    if (Array.isArray(dataset.roots)) dataset.roots = dataset.roots.map((entry: unknown) => typeof entry === "string" ? path.resolve(root, entry) : entry);
+    resolveField(dataset, "root");
+    resolveField(dataset, "tokenFile");
+  }
+  resolveField(value.benchmark, "embeddingCacheDirectory");
+  resolveField(value.reranker, "cacheDirectory");
+  resolveField(value.queryGeneration, "apiKeyFile");
+  resolveField(value.qrelReview, "apiKeyFile");
+  resolveField(value.codex, "homeDirectory");
+  if (value.codex && typeof value.codex.command === "string" && /[/\\]/u.test(value.codex.command)) resolveField(value.codex, "command");
+  return evaluationConfigSchema.parse(value);
 }
 
 export async function readEvaluationManifest(file: string): Promise<EvaluationManifest> {

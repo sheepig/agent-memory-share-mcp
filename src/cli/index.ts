@@ -16,10 +16,13 @@ import {
   type DaemonConfig,
 } from "../server/config.js";
 import { getDaemonStatus, readDaemonLogs, startDaemon, stopDaemon } from "../server/daemon-control.js";
+import { createFileLogger, type FileLogger } from "../server/file-logger.js";
 import { getDataDirectory } from "../server/paths.js";
-import { processIsRunning, readRuntime } from "../server/runtime-state.js";
+import { logPath, processIsRunning, readRuntime } from "../server/runtime-state.js";
 import { startServer } from "../server/start.js";
 import { APP_VERSION } from "../version.js";
+
+let daemonLogger: FileLogger | undefined;
 
 const agents = ["claude-code", "codex", "cursor", "opencode"] as const;
 
@@ -96,7 +99,11 @@ function updateConfigValue(config: DaemonConfig, key: string, value: string): Da
     if (value !== "true" && value !== "false") throw new InvalidArgumentError("rerankerEnabled must be true or false");
     return { ...config, rerankerEnabled: value === "true" };
   }
-  throw new InvalidArgumentError("key must be host, port, scanIntervalSeconds, or rerankerEnabled");
+  if (key.startsWith("sessionFragmentLimits.")) {
+    const agent = parseAgent(key.slice("sessionFragmentLimits.".length));
+    return { ...config, sessionFragmentLimits: { ...config.sessionFragmentLimits, [agent]: parseInteger(value, 1) } };
+  }
+  throw new InvalidArgumentError("key must be host, port, scanIntervalSeconds, rerankerEnabled, or sessionFragmentLimits.<agent>");
 }
 
 const program = new Command()
@@ -106,11 +113,35 @@ const program = new Command()
   .option("--data-dir <path>", "application data directory")
   .option("--json", "emit stable JSON output");
 
+program.hook("preAction", async (_program, command) => {
+  if (command.name() === "serve" && command.opts().daemonChild) {
+    const dataDirectory = getDataDirectory(command.optsWithGlobals<{ dataDir?: string }>().dataDir);
+    daemonLogger = await createFileLogger(logPath(dataDirectory));
+    process.once("beforeExit", () => { void daemonLogger?.close(); });
+  }
+});
+
 program.command("init")
   .description("Initialize the local application configuration.")
   .action((_options, command) => {
     const current = context(command);
     output({ config: initializeDaemonConfig(current.dataDirectory), dataDirectory: current.dataDirectory }, current.json);
+  });
+
+program.command("start")
+  .description("Start the local background service and show its MCP URL and Agent connection instructions.")
+  .option("--source-home <path>", "override the Agent source home directory")
+  .action(async (options: { sourceHome?: string }, command) => {
+    const current = context(command);
+    const status = await startDaemon(current.config, current.dataDirectory, { sourceHome: options.sourceHome });
+    const webUrl = status.mcpUrl?.replace(/\/mcp$/, "/");
+    output(current.json ? { ...status, webUrl } : [
+      status.alreadyRunning ? "Local MCP service is already running." : "Local MCP service started.",
+      `MCP: ${status.mcpUrl}`,
+      `Web: ${webUrl}`,
+      "Connect Codex: agent-memory connect codex",
+      "Stop: agent-memory daemon stop",
+    ].join("\n"), current.json);
   });
 
 program.command("serve")
@@ -126,6 +157,7 @@ program.command("serve")
       dataDirectory: current.dataDirectory,
       host: options.host ?? current.config.host,
       homeDirectory: options.sourceHome,
+      loggerInstance: daemonLogger?.logger,
       port: options.port ?? current.config.port,
       scanIntervalMs: (options.scanInterval ?? current.config.scanIntervalSeconds) * 1_000,
       writeLogs: options.daemonChild || current.json,
@@ -165,7 +197,7 @@ program.command("rebuild").description("Rebuild all selected derived indexes.").
 
 program.command("doctor").description("Check daemon, MCP, index, source, and Agent integration readiness.").action(async (_options, command) => {
   const current = context(command);
-  const result = await runDoctor({ api: current.api, homeDirectory: os.homedir(), mcpUrl: mcpUrl(current.apiAddress) });
+  const result = await runDoctor({ api: current.api, homeDirectory: os.homedir(), mcpUrl: mcpUrl(current.apiAddress), sources: current.config.sources });
   output(result, current.json);
   if (!result.ok) process.exitCode = 1;
 });
@@ -222,6 +254,7 @@ sessions.command("restore <candidateId>").action(async (candidateId: string, _op
 program.command("search <query>")
   .description("Search selected sessions and agent memories.")
   .option("--agent <agent>", "agent filter", parseAgent)
+  .option("--exclude-agent <agent>", "exclude this agent's memories and sessions: claude-code, codex, cursor, opencode", parseAgent)
   .option("--limit <count>", "result limit", (value) => parseInteger(value, 1, 100), 20)
   .option("--mode <mode>", "keyword, semantic, or hybrid", parseSearchMode, "keyword")
   .option("--context-project-path <path>", "project path used only as a ranking preference")
@@ -272,7 +305,10 @@ try {
   await program.parseAsync();
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
-  if (process.argv.includes("--json") && !process.argv.includes("mcp-stdio")) {
+  if (daemonLogger) {
+    daemonLogger.logger.error({ err: error }, "Daemon startup failed.");
+    await daemonLogger.close();
+  } else if (process.argv.includes("--json") && !process.argv.includes("mcp-stdio")) {
     process.stdout.write(`${JSON.stringify({ error: message })}\n`);
   } else {
     process.stderr.write(`Error: ${message}\n`);

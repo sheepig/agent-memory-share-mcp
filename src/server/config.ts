@@ -4,13 +4,47 @@ import path from "node:path";
 import { z } from "zod";
 
 import { searchSettingsSchema, type SearchSettings } from "../contracts/search-settings.js";
+import { defaultSourcePaths } from "../sources/source-paths.js";
 import { isLoopbackHost } from "./paths.js";
+
+const sourcePathSchema = z.string().min(1).max(4_096).refine(
+  (value) => !value.includes("\0") && (path.isAbsolute(value) || value === "~" || value.startsWith("~/")),
+  "source paths must be absolute or start with ~/",
+);
+const sourceRootsSchema = z.array(sourcePathSchema).max(64);
+const sourcePathsSchema = z.object({
+  codex: z.object({
+    sessionRoots: sourceRootsSchema.default(defaultSourcePaths.codex.sessionRoots),
+    memoryRoots: sourceRootsSchema.default(defaultSourcePaths.codex.memoryRoots),
+  }).strict().default(defaultSourcePaths.codex),
+  "claude-code": z.object({
+    projectRoots: sourceRootsSchema.default(defaultSourcePaths["claude-code"].projectRoots),
+    memoryRoots: sourceRootsSchema.optional(),
+  }).strict().default(defaultSourcePaths["claude-code"]),
+  cursor: z.object({
+    sessionRoots: sourceRootsSchema.default(defaultSourcePaths.cursor.sessionRoots),
+  }).strict().default(defaultSourcePaths.cursor),
+  opencode: z.object({
+    databasePath: sourcePathSchema.default(defaultSourcePaths.opencode.databasePath),
+  }).strict().default(defaultSourcePaths.opencode),
+}).strict().default(defaultSourcePaths);
+
+export const defaultSessionFragmentLimits = { codex: 5_000, "claude-code": 5_000, cursor: 5_000, opencode: 5_000 };
+const sessionFragmentLimitSchema = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
+const sessionFragmentLimitsSchema = z.object({
+  codex: sessionFragmentLimitSchema.default(defaultSessionFragmentLimits.codex),
+  "claude-code": sessionFragmentLimitSchema.default(defaultSessionFragmentLimits["claude-code"]),
+  cursor: sessionFragmentLimitSchema.default(defaultSessionFragmentLimits.cursor),
+  opencode: sessionFragmentLimitSchema.default(defaultSessionFragmentLimits.opencode),
+}).strict().default(defaultSessionFragmentLimits);
 
 export const daemonConfigSchema = z.object({
   host: z.string().refine(isLoopbackHost, "host must be a loopback address"),
   port: z.number().int().min(1).max(65_535),
   rerankerEnabled: searchSettingsSchema.shape.rerankerEnabled.default(false),
   scanIntervalSeconds: z.number().int().min(0),
+  sources: sourcePathsSchema,
+  sessionFragmentLimits: sessionFragmentLimitsSchema,
 });
 
 export type DaemonConfig = z.infer<typeof daemonConfigSchema>;
@@ -20,6 +54,8 @@ export const defaultDaemonConfig: DaemonConfig = {
   port: 43_110,
   rerankerEnabled: false,
   scanIntervalSeconds: 60,
+  sources: defaultSourcePaths,
+  sessionFragmentLimits: defaultSessionFragmentLimits,
 };
 
 function environmentDaemonConfig(): DaemonConfig {
@@ -71,7 +107,9 @@ export function updateSearchSettings(dataDirectory: string, settings: SearchSett
 export function initializeDaemonConfig(dataDirectory: string): DaemonConfig {
   const file = configPath(dataDirectory);
   if (fs.existsSync(file)) {
-    return readDaemonConfig(dataDirectory);
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    const config = daemonConfigSchema.parse(raw);
+    return raw.sources === undefined || raw.sessionFragmentLimits === undefined ? writeDaemonConfig(dataDirectory, config) : config;
   }
   return writeDaemonConfig(dataDirectory, environmentDaemonConfig());
 }

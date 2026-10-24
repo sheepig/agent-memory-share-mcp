@@ -13,6 +13,7 @@ export interface EmbeddingProvider extends ContentTokenCounter {
   readonly modelId: string;
   embedPassages(texts: readonly string[]): Promise<Float32Array[]>;
   embedQuery(text: string): Promise<Float32Array>;
+  dispose?(): Promise<void>;
 }
 
 function rows(tensor: Tensor): Float32Array[] {
@@ -51,7 +52,7 @@ export class LocalContentTokenizer implements ContentTokenCounter {
     this.tokenizer ??= import("@huggingface/transformers").then(({ AutoTokenizer }) => AutoTokenizer.from_pretrained(
       EMBEDDING_MODEL_REPOSITORY,
       { cache_dir: this.cacheDirectory, revision: EMBEDDING_MODEL_REVISION },
-    ));
+    )).catch((error: unknown) => { this.tokenizer = undefined; throw error; });
     return this.tokenizer;
   }
 }
@@ -71,6 +72,12 @@ export class LocalEmbeddingProvider extends LocalContentTokenizer implements Emb
     return embedding;
   }
 
+  async dispose(): Promise<void> {
+    const extractor = this.extractor;
+    this.extractor = undefined;
+    if (extractor) await extractor.then((loaded) => loaded.dispose(), () => undefined);
+  }
+
   private async embed(texts: string[]): Promise<Float32Array[]> {
     await this.validateModelInputs(texts);
     const extractor = await this.getExtractor();
@@ -86,7 +93,7 @@ export class LocalEmbeddingProvider extends LocalContentTokenizer implements Emb
     )).then((extractor) => {
       extractor.tokenizer.config.model_max_length = EMBEDDING_MAX_INPUT_TOKENS;
       return extractor;
-    });
+    }).catch((error: unknown) => { this.extractor = undefined; throw error; });
     return this.extractor;
   }
 }

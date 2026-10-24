@@ -17,6 +17,7 @@ playwright/.cache/
 !.env.example
 
 # Runtime data
+/trajectories/
 *.log
 *.pid
 *.sock

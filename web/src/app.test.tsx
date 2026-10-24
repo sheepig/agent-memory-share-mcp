@@ -77,7 +77,7 @@ describe("App", () => {
     await waitFor(() => expect(api.retryEmbeddings).toHaveBeenCalledOnce());
   });
 
-  it("lists sessions and lets the user select a discovered session", async () => {
+  it("lists automatically admitted sessions and lets the user exclude a waiting session", async () => {
     api.getSessions.mockResolvedValue({
       counts: { discovered: 1, excluded: 0, selected: 1 },
       sessions: [
@@ -93,6 +93,7 @@ describe("App", () => {
           updatedAt: "2026-10-15T09:00:00.000Z",
         },
         {
+          admissionReason: "capacity",
           agent: "claude-code",
           candidateId: "discovered",
           disposition: "discovered",
@@ -106,15 +107,36 @@ describe("App", () => {
       total: 2,
     });
 
+    api.getIndexStatus.mockResolvedValue({ activeScanCheckpoints: 0, embedding: { indexed: 1 }, fragments: 2, processing: { indexed: 1 }, sessionCapacity: {
+      codex: { fragmentLimit: 5000, fragments: 200, reservedFragments: 0, selectedSessions: 1, waitingSessions: 0 },
+      "claude-code": { fragmentLimit: 5000, fragments: 5000, reservedFragments: 0, selectedSessions: 20, waitingSessions: 1 },
+    } });
     renderRoute("/sessions");
 
+    expect(await screen.findByText("Codex：200 / 5000 片段")).toBeInTheDocument();
     expect(await screen.findByText("Improve evidence search")).toBeInTheDocument();
     expect(screen.getByText("Review source adapters")).toBeInTheDocument();
     expect(screen.getByText("1 个已参与")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "参与索引 Review source adapters" }));
+    fireEvent.click(screen.getByRole("button", { name: "剔除 Review source adapters" }));
 
-    await waitFor(() => expect(api.indexSession).toHaveBeenCalledWith("discovered"));
+    await waitFor(() => expect(api.excludeSession).toHaveBeenCalledWith("discovered"));
+  });
+
+  it("restores an excluded session without bypassing its capacity wait", async () => {
+    const session = { agent: "codex", candidateId: "excluded", disposition: "excluded", indexStatus: "indexed", sessionId: "old", sourcePath: "/sessions/old.jsonl", title: "Older session", updatedAt: "2026-10-14T09:00:00.000Z" };
+    api.getSessions.mockResolvedValue({ counts: { discovered: 0, excluded: 1, selected: 0 }, sessions: [session], total: 1 });
+    api.restoreSession.mockImplementation(async () => {
+      api.getSessions.mockResolvedValue({ counts: { discovered: 1, excluded: 0, selected: 0 }, sessions: [{ ...session, admissionReason: "capacity", disposition: "discovered", indexStatus: "discovered" }], total: 1 });
+      return { candidateId: "excluded", disposition: "discovered", admissionReason: "capacity", fragmentCount: 0, sourcePath: session.sourcePath };
+    });
+    renderRoute("/sessions");
+
+    fireEvent.click(await screen.findByRole("button", { name: "恢复 Older session" }));
+    await waitFor(() => expect(api.restoreSession).toHaveBeenCalledWith("excluded"));
+    expect(await screen.findByText("容量等待")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "剔除 Older session" })).toBeEnabled();
+    expect(api.indexSession).not.toHaveBeenCalled();
   });
 
   it("submits a search and renders inspectable provenance", async () => {

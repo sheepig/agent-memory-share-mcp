@@ -3,6 +3,7 @@ import { z } from "zod";
 import { searchSettingsSchema, type SearchSettings } from "../contracts/search-settings.js";
 
 const sessionSchema = z.object({
+  admissionReason: z.enum(["capacity", "oversized"]).optional(),
   agent: z.string(),
   candidateId: z.string(),
   disposition: z.enum(["discovered", "excluded", "selected"]),
@@ -89,6 +90,7 @@ export class LocalApiClient {
 
   search(input: {
     agent?: string;
+    excludeAgent?: "claude-code" | "codex" | "cursor" | "opencode";
     contextProjectPath?: string;
     limit?: number;
     mode?: "hybrid" | "keyword" | "semantic";
@@ -100,6 +102,7 @@ export class LocalApiClient {
   }) {
     const query = new URLSearchParams({ query: input.query });
     if (input.agent) query.set("agent", input.agent);
+    if (input.excludeAgent) query.set("excludeAgent", input.excludeAgent);
     if (input.contextProjectPath) query.set("contextProjectPath", input.contextProjectPath);
     if (input.limit !== undefined) query.set("limit", String(input.limit));
     if (input.mode) query.set("mode", input.mode);

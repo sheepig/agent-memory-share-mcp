@@ -45,6 +45,7 @@ export type SourceProcessingState =
 export type EmbeddingState = "disabled" | "failed" | "indexed" | "indexing" | "pending";
 
 export interface SessionCandidate {
+  admissionReason?: "capacity" | "oversized";
   agent: string;
   candidateId: string;
   disposition: SourceDisposition;

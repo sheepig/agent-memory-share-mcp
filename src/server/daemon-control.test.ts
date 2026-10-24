@@ -4,7 +4,8 @@ import path from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { getDaemonStatus, readDaemonLogs, stopDaemon } from "./daemon-control.js";
+import { getDaemonStatus, readDaemonLogs, startDaemon, stopDaemon } from "./daemon-control.js";
+import { defaultDaemonConfig } from "./config.js";
 import { acquireInstanceLock } from "./instance-lock.js";
 import { writeRuntime } from "./runtime-state.js";
 
@@ -55,5 +56,26 @@ describe("daemon control", () => {
 
     await expect(stopDaemon(directory, 100)).rejects.toThrow("daemon identity could not be verified");
     lock.release();
+  });
+
+  it("does not report a running but unreachable daemon as a successful start", async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "agent-memory-daemon-"));
+    temporaryDirectories.push(directory);
+    const lock = acquireInstanceLock(directory);
+    writeRuntime(directory, {
+      host: "127.0.0.1",
+      instanceToken: lock.token,
+      logPath: path.join(directory, "daemon.log"),
+      mcpUrl: "http://127.0.0.1:9/mcp",
+      pid: process.pid,
+      port: 9,
+      startedAt: new Date().toISOString(),
+    });
+
+    try {
+      await expect(startDaemon(defaultDaemonConfig, directory)).rejects.toThrow("not reachable");
+    } finally {
+      lock.release();
+    }
   });
 });

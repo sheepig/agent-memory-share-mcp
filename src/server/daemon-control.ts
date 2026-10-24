@@ -71,29 +71,26 @@ export async function startDaemon(
   const dataDirectory = getDataDirectory(dataDirectoryOverride);
   const current = await getDaemonStatus(dataDirectory);
   if (current.running) {
+    if (!current.reachable) {
+      throw new Error(`Daemon PID ${current.pid} is running but not reachable. Check ${logPath(dataDirectory)}.`);
+    }
     return { ...current, alreadyRunning: true };
   }
   fs.mkdirSync(dataDirectory, { recursive: true });
   const cliPath = options.cliPath ?? fileURLToPath(new URL("../cli/index.js", import.meta.url));
-  const output = fs.openSync(logPath(dataDirectory), "a", 0o600);
-  let child;
-  try {
-    child = spawn(process.execPath, [
-      cliPath,
-      "serve",
-      "--host", config.host,
-      "--port", String(config.port),
-      "--scan-interval", String(config.scanIntervalSeconds),
-      "--data-dir", dataDirectory,
-      "--daemon-child",
-      ...(options.sourceHome ? ["--source-home", options.sourceHome] : []),
-    ], {
-      detached: true,
-      stdio: ["ignore", output, output],
-    });
-  } finally {
-    fs.closeSync(output);
-  }
+  const child = spawn(process.execPath, [
+    cliPath,
+    "serve",
+    "--host", config.host,
+    "--port", String(config.port),
+    "--scan-interval", String(config.scanIntervalSeconds),
+    "--data-dir", dataDirectory,
+    "--daemon-child",
+    ...(options.sourceHome ? ["--source-home", options.sourceHome] : []),
+  ], {
+    detached: true,
+    stdio: "ignore",
+  });
   child.unref();
 
   const timeoutAt = Date.now() + (options.timeoutMs ?? 15_000);

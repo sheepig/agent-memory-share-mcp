@@ -2,12 +2,13 @@ import type { SearchFragmentsInput } from "../application/source-service.js";
 import type { FragmentSearchResult } from "../domain/source.js";
 import type { AppDatabase } from "../storage/database.js";
 import { buildSearchExcerpt } from "./excerpt.js";
-import { cosineSimilarity, decodeEmbedding, type EmbeddingProvider } from "./embedding.js";
+import type { EmbeddingProvider } from "./embedding.js";
 import type { FragmentRow } from "./fragment-row.js";
 import { normalizeSearchText } from "./normalize.js";
 import type { RerankerProvider } from "./reranker.js";
-import { countDiverseSessionChunks, diversifySessionChunks } from "./session-diversity.js";
-import { buildFtsQuery } from "./tokens.js";
+import { diversifySessionChunks } from "./session-diversity.js";
+import { searchKeywordRows, type FragmentReference } from "./keyword-search.js";
+import { searchSemanticRows } from "./semantic-search.js";
 
 export interface FragmentSearchCandidate {
   reason: string;
@@ -15,7 +16,7 @@ export interface FragmentSearchCandidate {
   score?: number;
 }
 
-function fragmentIdentity(row: FragmentRow) {
+function fragmentIdentity(row: FragmentReference) {
   return {
     endLocation: row.end_location,
     location: row.location,
@@ -61,6 +62,7 @@ export class FragmentSearch {
         score: scores[index]!,
       })).sort((left, right) => right.score - left.score);
     }
+    candidates = this.availableCandidates(input, candidates);
     return {
       results: diversifySessionChunks(candidates, (value) => fragmentIdentity(value.row), input.limit)
         .map(({ reason, row, score }) => mapFragmentSearchResult(row, reason, input.query, score)),
@@ -81,11 +83,20 @@ export class FragmentSearch {
       throw new Error("Embedding search is not configured.");
     }
     const candidateLimit = Math.max(input.limit * 4, 50, candidateCount ?? 0);
-    const keywordRows = mode === "semantic" ? [] : this.searchKeywordRows(
-      input, mode === "keyword" ? candidateCount ?? input.limit : candidateLimit,
-    );
-    const contextReason = (row: FragmentRow) => input.contextProjectPath === row.project_path ? " + project context" : "";
-    let candidates: FragmentSearchCandidate[];
+    const semanticRows = mode === "keyword" ? [] : await searchSemanticRows(this.database, input, {
+      embeddingProvider: this.embeddingProvider!,
+      ...this.searchFilters(input),
+      limit: mode === "semantic" ? candidateCount ?? input.limit : candidateLimit,
+      diversify: mode === "semantic" && candidateCount === undefined,
+    });
+    const keywordRows = mode === "semantic" ? [] : await searchKeywordRows(this.database, input, {
+      ...this.searchFilters(input),
+      limit: mode === "keyword" ? candidateCount ?? input.limit : candidateLimit,
+      diversify: mode === "hybrid" || candidateCount === undefined,
+      keepIds: new Set(semanticRows.map(({ row }) => row.fragment_id)),
+    });
+    const contextReason = (row: FragmentReference) => input.contextProjectPath === row.project_path ? " + project context" : "";
+    let candidates: Array<{ reason: string; row: FragmentReference; score?: number }>;
     if (mode === "keyword") {
       const normalizedQuery = normalizeSearchText(input.query);
       candidates = keywordRows.map((row) => ({
@@ -93,13 +104,12 @@ export class FragmentSearch {
         reason: `${normalizeSearchText(row.fragment_title ?? "").includes(normalizedQuery) ? "title match" : "body match"}${contextReason(row)}`,
       }));
     } else {
-      const semanticRows = await this.searchSemanticRows(input);
       if (mode === "semantic") {
         candidates = semanticRows.map(({ row, score }) => ({ row, score, reason: `semantic similarity${contextReason(row)}` }));
       } else {
-        const fused = new Map<string, { reason: string; row: FragmentRow; score: number }>();
-        keywordRows.forEach((row, index) => {
-          fused.set(row.fragment_id, { reason: "keyword match", row, score: 1 / (60 + index + 1) });
+        const fused = new Map<string, { reason: string; row: FragmentReference; score: number }>();
+        keywordRows.forEach((row) => {
+          fused.set(row.fragment_id, { reason: "keyword match", row, score: 1 / (60 + row.keyword_rank + 1) });
         });
         semanticRows.slice(0, candidateLimit).forEach(({ row }, index) => {
           const existing = fused.get(row.fragment_id);
@@ -113,60 +123,39 @@ export class FragmentSearch {
           .map((candidate) => ({ ...candidate, reason: `${candidate.reason}${contextReason(candidate.row)}` }));
       }
     }
-    return candidateCount === undefined ? candidates : candidates.slice(0, candidateCount);
+    const selected = candidateCount === undefined
+      ? diversifySessionChunks(candidates, (candidate) => fragmentIdentity(candidate.row), input.limit)
+      : candidates.slice(0, candidateCount);
+    return this.readCandidates(input, selected);
   }
 
-  private searchKeywordRows(input: SearchFragmentsInput, limit: number): FragmentRow[] {
-    const match = buildFtsQuery(input.query);
-    if (!match) return [];
+  private readCandidates(input: SearchFragmentsInput, candidates: Array<{
+    reason: string; row: FragmentReference; score?: number;
+  }>): FragmentSearchCandidate[] {
     const { filters, values } = this.searchFilters(input);
-    const pageSize = Math.max(limit, 50);
     const statement = this.database.prepare(`
       SELECT f.id AS fragment_id, f.role, f.location, f.end_location, f.started_at, f.ended_at,
-             f.turn_count, f.chunk_index, f.content_tokens, f.title AS fragment_title, f.body,
+             f.turn_count, f.chunk_index, f.content_tokens, f.content_hash, f.title AS fragment_title, f.body,
              s.id AS source_id, s.external_source_id, s.source_type, s.agent, s.source_path,
              s.project_path, s.original_session_id, s.content_fingerprint, s.source_updated_at, s.title AS source_title
-      FROM fragment_search
-      JOIN fragments f ON f.id = fragment_search.fragment_id
-      JOIN sources s ON s.id = f.source_id
-      WHERE fragment_search MATCH ? AND ${filters.join(" AND ")}
-      ORDER BY CASE WHEN ? IS NOT NULL AND s.project_path = ? THEN 0 ELSE 1 END,
-               bm25(fragment_search, 0.0, 5.0, 1.0), s.source_updated_at DESC, f.ordinal, f.id
-      LIMIT ? OFFSET ?
+      FROM fragments f JOIN sources s ON s.id = f.source_id
+      WHERE f.id = ? AND f.content_hash = ? AND s.content_fingerprint = ? AND ${filters.join(" AND ")}
     `);
-    const rows: FragmentRow[] = [];
-    for (let offset = 0; ; offset += pageSize) {
-      const page = statement.all(
-        match, ...values, input.contextProjectPath ?? null, input.contextProjectPath ?? null, pageSize, offset,
-      ) as FragmentRow[];
-      rows.push(...page);
-      if (page.length < pageSize || countDiverseSessionChunks(rows, fragmentIdentity) >= limit) return rows;
-    }
+    return candidates.flatMap((candidate) => {
+      const row = statement.get(candidate.row.fragment_id, candidate.row.content_hash,
+        candidate.row.content_fingerprint, ...values) as FragmentRow | undefined;
+      return row ? [{ ...candidate, row }] : [];
+    });
   }
 
-  private async searchSemanticRows(input: SearchFragmentsInput): Promise<Array<{ row: FragmentRow; score: number }>> {
-    const embeddingProvider = this.embeddingProvider!;
-    const query = await embeddingProvider.embedQuery(input.query);
+  private availableCandidates(input: SearchFragmentsInput, candidates: FragmentSearchCandidate[]): FragmentSearchCandidate[] {
     const { filters, values } = this.searchFilters(input);
-    const rows = this.database.prepare(`
-      SELECT f.id AS fragment_id, f.role, f.location, f.end_location, f.started_at, f.ended_at,
-             f.turn_count, f.chunk_index, f.content_tokens, f.title AS fragment_title, f.body,
-             s.id AS source_id, s.external_source_id, s.source_type, s.agent, s.source_path,
-             s.project_path, s.original_session_id, s.content_fingerprint, s.source_updated_at, s.title AS source_title,
-             e.embedding
-      FROM fragment_embeddings e
-      JOIN fragments f ON f.id = e.fragment_id
-      JOIN sources s ON s.id = f.source_id
-      WHERE e.model_id = ? AND s.embedding_state = 'indexed' AND ${filters.join(" AND ")}
-    `).all(embeddingProvider.modelId, ...values) as FragmentRow[];
-    return rows
-      .map((row) => ({
-        row,
-        score: cosineSimilarity(query, decodeEmbedding(row.embedding!))
-          + (input.contextProjectPath && row.project_path === input.contextProjectPath ? 0.05 : 0),
-      }))
-      .filter(({ score }) => Number.isFinite(score))
-      .sort((left, right) => right.score - left.score);
+    const statement = this.database.prepare(`
+      SELECT 1 FROM fragments f JOIN sources s ON s.id = f.source_id
+      WHERE f.id = ? AND f.content_hash = ? AND s.content_fingerprint = ?
+        AND ${input.mode === "semantic" ? "s.embedding_state = 'indexed' AND" : ""} ${filters.join(" AND ")}
+    `);
+    return candidates.filter(({ row }) => statement.get(row.fragment_id, row.content_hash, row.content_fingerprint, ...values));
   }
 
   private searchFilters(input: SearchFragmentsInput): { filters: string[]; values: unknown[] } {
@@ -179,6 +168,10 @@ export class FragmentSearch {
     if (input.agent) {
       filters.push("s.agent = ?");
       values.push(input.agent);
+    }
+    if (input.excludeAgent) {
+      filters.push("s.agent <> ?");
+      values.push(input.excludeAgent);
     }
     if (input.projectPath) {
       filters.push("s.project_path = ?");

@@ -3,6 +3,8 @@ import path from "node:path";
 import { InvalidArgumentError, type Command } from "commander";
 
 import { buildChunkAblationPool, runChunkAblation } from "../evaluation/chunk-ablation.js";
+import { runChunkAblationWorkflow } from "../evaluation/chunk-ablation-run.js";
+import { createChunkAblationConfig } from "../evaluation/chunk-ablation-config.js";
 import { runBenchmark, validateReviewedCandidates } from "../evaluation/benchmark.js";
 import { readEvaluationConfig, readEvaluationManifest, readQueryCandidates } from "../evaluation/files.js";
 import { materializeSweChat } from "../evaluation/hugging-face.js";
@@ -180,6 +182,31 @@ export function registerEvaluationCommands(program: Command, emit: Emit): void {
     });
 
   const ablation = evaluation.command("ablate-chunks").description("Compare Session chunk sizes and overlaps against one reviewed passage pool.");
+
+  ablation.command("init")
+    .option("--output <path>", "new local config file (never overwritten)", ".agent-memory-share-mcp/evaluation/config.json")
+    .option("--codex-sessions <directory>", "Codex Session directory")
+    .option("--claude-sessions <directory>", "Claude Code Session directory")
+    .option("--swe-chat", "configure pinned public SWE-chat Codex and Claude Code Sessions", false)
+    .option("--revision <commit>", "full SWE-chat commit hash")
+    .option("--queries <count>", "maximum quality-accepted queries across all splits", positiveInteger, 64)
+    .description("Create an editable portable chunk-ablation config for local or SWE-chat Sessions.")
+    .action(async (options: { output: string; codexSessions?: string; claudeSessions?: string; sweChat: boolean; revision?: string; queries: number }, command) => {
+      emit(await createChunkAblationConfig(options), jsonMode(command));
+    });
+
+  ablation.command("run")
+    .requiredOption("--config <path>", "portable evaluation config JSON")
+    .option("--allow-external-model", "authorize sending the configured dataset allow-lists to query/review models", false)
+    .description("Fetch/scan, generate queries, pool variants, review silver qrels and benchmark; resume matching checkpoints.")
+    .action(async (options: { config: string; allowExternalModel: boolean }, command) => {
+      const config = await readEvaluationConfig(path.resolve(options.config));
+      const result = await runChunkAblationWorkflow(config, {
+        allowExternalModel: options.allowExternalModel,
+        onProgress: (stage) => process.stderr.write(`${JSON.stringify({ evaluationStage: stage })}\n`),
+      });
+      emit(result, jsonMode(command));
+    });
 
   ablation.command("pool")
     .requiredOption("--config <path>", "evaluation config with chunkAblation.variants")

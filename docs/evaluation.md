@@ -4,10 +4,112 @@ The evaluation runner uses the production Codex and Claude Code adapters, turn c
 keyword search, and optional local embedding model. It accepts the same JSON configuration on a laptop
 or a cloud server. Evaluation never writes to original Session files.
 
+## Portable chunk-ablation quick start
+
+On the destination machine, clone the repository, install Node.js 22.12 or newer, and run:
+
+```bash
+npm ci
+npm run build
+```
+
+Install and log in to a Codex CLI that supports the configured model, `app-server --stdio`,
+`debug prompt-input`, ephemeral threads, structured output, and reasoning effort. The generated config
+uses `gpt-5.6-luna` with `high` effort for query generation, query quality review, and relevance review.
+The account must have access to that model. The native transport was verified with CLI
+`0.163.0-alpha.11` on macOS; Windows execution has not been verified. File-based login at
+`$CODEX_HOME/auth.json` or `~/.codex/auth.json` is required. Set `codex.homeDirectory` for another existing
+login directory, or `codex.command` for a compatible executable outside `PATH`. Credentials stay in the
+existing protected file and are referenced through a temporary file link; the temporary filesystem must
+support links (on Windows, hard links require the same volume).
+
+Create a configuration for local Sessions, supplying either or both directories:
+
+```bash
+node dist/cli/index.js --json eval ablate-chunks init \
+  --codex-sessions /data/codex/sessions \
+  --claude-sessions /data/claude/projects \
+  --queries 64 \
+  --output .agent-memory-share-mcp/evaluation/local/config.json
+```
+
+The directories must contain native Codex or Claude Code JSONL Sessions. Discovery, visible-message
+filtering, redaction, complete-turn qualification, token counting, and retrieval reuse the production
+implementations. Source files remain read-only. For multiple roots of the same Agent, edit its `roots`
+array in the generated JSON.
+
+Alternatively, create a configuration for SWE-chat. Supply an actual full, 40-character dataset commit
+hash in `SWE_CHAT_REVISION`, and make a read-only Hugging Face token available through `HF_TOKEN` after
+gaining dataset access:
+
+```bash
+node dist/cli/index.js --json eval ablate-chunks init \
+  --swe-chat --revision "$SWE_CHAT_REVISION" --queries 64 \
+  --output .agent-memory-share-mcp/evaluation/swe/config.json
+```
+
+This selects both Codex and Claude Code collections from `SALT-NLP/SWE-chat`, with at most 100 source
+files per Agent initially. Edit `maxSourceFiles` before the first run to change that sample. A dataset
+revision is required so another machine can fetch the same source collection. Downloads go under the
+configuration directory's `data/`; changing revision or sample size requires a separate data root.
+
+Inspect the generated JSON, then run:
+
+```bash
+node dist/cli/index.js --json eval ablate-chunks run \
+  --config .agent-memory-share-mcp/evaluation/local/config.json \
+  --allow-external-model
+```
+
+For the SWE configuration, use its config path instead. `--allow-external-model` explicitly authorizes
+sending redacted evidence from the `queryGeneration.datasetIds` and `qrelReview.datasetIds` allow-lists
+to their configured models. The pipeline fetches remote data when needed, scans Sessions, generates and
+checks queries, pools all chunk variants, judges each query/passage, and writes JSON and offline HTML
+reports. Progress goes to stderr; the final JSON includes report paths, pooled query count, and judged
+pair count. This evaluation uses separate SQLite databases and does not require the product daemon.
+
+The initial variants are 1024/64, 512/64, 2048/64, and 1024/0 (content-token length/overlap). All three
+retrieval modes run, with the pinned local embedding model downloaded to `models/` on first use. Each
+complete turn is independent; splitting and overlap remain inside that turn. Reranking stays disabled
+in this chunk comparison. Optional `benchmark.standardTools` enables the existing `trec_eval` and
+`ir_measures` cross-check; without it, the report records `not_configured`.
+
+`--queries` is the maximum quality-accepted query count across all splits, not a Session count or the
+number guaranteed to enter the benchmark. Generation visits source chunks round-robin across datasets
+and generates at most one query per original turn. It does not guarantee distinct seed Sessions or a
+quota of long turns. Inspect actual Session, split, and split-turn counts in the outputs. Project-based,
+deterministic splitting defaults to 60% dev, 20% validation, and 20% test; missing project metadata uses
+Session grouping. The generated configuration evaluates `dev` for parameter exploration. Use validation
+for selection and an untouched test set for the final check. An empty configured split fails explicitly.
+
+Run the same command to resume. `ablation-run.json` binds configuration, rule/model versions, source
+fingerprints, queries, pool, and silver qrels. Completed stages are reused; individual native model
+responses are also checkpointed by exact input. A changed configuration or frozen artifact is rejected.
+Use a new `outputDirectory` when changing datasets, paths, parameters, models, or split settings. When
+moving to another machine, reuse the code and adjust source paths in a new local config; create a fresh
+run there. Copying an old run with different absolute paths does not make it resumable.
+
+Native model calls use an empty temporary working directory, separate `HOME` and `CODEX_HOME`, an
+environment allow-list, disabled tools/plugins/skills/memory, and a fresh ephemeral thread for each
+distinct input. The runner checks model, effort, initial turns, external instruction sources, and tool
+attempts before accepting a response. Incompatible CLI context or protocol fails explicitly. Receipts
+under `run/codex-calls/` retain input/instruction hashes and isolation metadata. Model judgments remain
+**silver qrels** and can contain errors; a successful run does not establish a statistically reliable
+chunk-size winner.
+
+All generated configuration, Sessions, databases, responses, and reports in these examples stay under
+the Git-ignored `.agent-memory-share-mcp/`. Commit the evaluation source and documentation; install
+packages and obtain credentials independently on the destination machine. Keep the complete report
+directory for offline evidence links. OpenAI-compatible HTTP transport remains available by setting
+`transport: "openai"` in the model sections and configuring their endpoint and protected credential file
+or environment variable as shown below.
+
 ## Configuration
 
-All paths are absolute. A dataset entry represents one Agent and one source collection so reports stay
-separable. `maxEligibleSessions` limits accepted Sessions, not files visited. Rejected files remain in
+Configuration paths may be absolute or relative to the configuration file directory. Bare executable
+commands such as `codex` are resolved through `PATH`; a `codex.command` containing a directory separator
+is resolved relative to the configuration file. A dataset entry represents one Agent and one source
+collection so reports stay separable. `maxEligibleSessions` limits accepted Sessions, not files visited. Rejected files remain in
 the aggregate diagnostic counts.
 
 ```json

@@ -13,15 +13,18 @@ import type {
 } from "../domain/source.js";
 import { SourceNotFoundError, SourceUnavailableError } from "../domain/source.js";
 import { normalizeSearchText } from "../search/normalize.js";
-import { encodeEmbedding, type EmbeddingProvider } from "../search/embedding.js";
+import type { EmbeddingProvider } from "../search/embedding.js";
 import { FragmentSearch, type FragmentSearchCandidate } from "../search/fragment-search.js";
 import type { RerankerProvider } from "../search/reranker.js";
 import { buildSearchTerms } from "../search/tokens.js";
 import { SENSITIVE_CONTENT_RULE_VERSION } from "../security/sensitive-content.js";
 import { createDesktopAdapters } from "../sources/desktop-sources.js";
-import type { SessionSourceAdapter, SourceAdapter, SourceDiagnostic } from "../sources/source-adapter.js";
+import type { SessionSourceAdapter, SourceAdapter, SourceDiagnostic, SourceDiscoveryStep } from "../sources/source-adapter.js";
 import type { ContentTokenCounter } from "../sources/session-turns.js";
 import type { AppDatabase } from "../storage/database.js";
+import { discoveryCache } from "./discovery-cache.js";
+import { EmbeddingIndexer, embeddingInput } from "./embedding-indexer.js";
+import { SessionCapacity } from "./session-capacity.js";
 
 export const INDEX_RULE_VERSION = 12;
 
@@ -45,6 +48,10 @@ interface SourceRow {
   source_updated_at: string;
   security_rule_version: number;
   title: string | null;
+  admission_reason: "capacity" | "oversized" | null;
+  session_fragment_count: number | null;
+  retry_after: string | null;
+  last_seen_scan_id: string | null;
 }
 
 export interface ListSessionsInput {
@@ -56,6 +63,7 @@ export interface ListSessionsInput {
 
 export interface SearchFragmentsInput {
   agent?: string;
+  excludeAgent?: "claude-code" | "codex" | "cursor" | "opencode";
   limit: number;
   mode?: SearchMode;
   contextProjectPath?: string;
@@ -73,6 +81,14 @@ export interface SourceScanResult {
   sessions: number;
   unavailable: number;
 }
+
+export type SessionIndexResult = {
+  candidateId: string;
+  fragmentCount: number;
+  sourcePath: string;
+  disposition?: SessionCandidate["disposition"];
+  admissionReason?: SessionCandidate["admissionReason"];
+};
 
 function digest(value: string): string {
   return createHash("sha256").update(value).digest("hex");
@@ -101,6 +117,7 @@ function rowToReference(row: SourceRow): SourceReference {
 
 function rowToSessionCandidate(row: SourceRow): SessionCandidate {
   return {
+    admissionReason: row.admission_reason ?? undefined,
     agent: row.agent,
     candidateId: row.id,
     disposition: row.disposition,
@@ -114,6 +131,8 @@ function rowToSessionCandidate(row: SourceRow): SessionCandidate {
 }
 
 export class SourceService {
+  private firstScan = true;
+  private scanStartedAt = "";
   private readonly memoryAdapters: SourceAdapter[];
   private readonly sessionAdapters: SessionSourceAdapter[];
 
@@ -127,6 +146,7 @@ export class SourceService {
       reranker?: RerankerProvider;
       isRerankerEnabled?: () => boolean;
       rerankCandidateCount?: number;
+      sessionFragmentLimits?: Readonly<Record<string, number>>;
     },
   ) {
     const contentTokenCounter = options.contentTokenCounter ?? options.embeddingProvider;
@@ -137,11 +157,15 @@ export class SourceService {
     this.memoryAdapters = adapters.memories;
     this.sessionAdapters = adapters.sessions;
     this.embeddingProvider = options.embeddingProvider;
+    this.embeddings = new EmbeddingIndexer(database, options.embeddingProvider);
+    this.capacity = new SessionCapacity(database, options.sessionFragmentLimits ?? {});
     this.fragmentSearch = new FragmentSearch(database, options);
   }
 
   private readonly embeddingProvider?: EmbeddingProvider;
   private readonly fragmentSearch: FragmentSearch;
+  private readonly embeddings: EmbeddingIndexer;
+  private readonly capacity: SessionCapacity;
 
   async listSessions(input: ListSessionsInput): Promise<{
     counts: Record<"discovered" | "excluded" | "selected", number>;
@@ -181,14 +205,15 @@ export class SourceService {
   }
 
   async getSessionConversation(candidateId: string): Promise<SessionConversation> {
-    const row = this.getSource(candidateId);
+    let row = this.getSource(candidateId);
     if (!row || row.source_type !== "session") {
       throw new SourceNotFoundError();
     }
     if (row.processing_state === "source_unavailable") {
       throw new SourceUnavailableError("The session source is no longer available.");
     }
-    const adapter = this.sessionAdapters.find((candidate) => candidate.agent === row.agent);
+    const agent = row.agent;
+    const adapter = this.sessionAdapters.find((candidate) => candidate.agent === agent);
     if (!adapter) {
       throw new Error(`No session adapter is registered for ${row.agent}.`);
     }
@@ -201,24 +226,25 @@ export class SourceService {
     return { messages, session: rowToSessionCandidate(row) };
   }
 
-  async indexSession(candidateId: string): Promise<{ candidateId: string; fragmentCount: number; sourcePath: string }> {
-    const row = this.getSource(candidateId);
+  async indexSession(candidateId: string, generateEmbeddings = true): Promise<SessionIndexResult> {
+    let row = this.getSource(candidateId);
     if (!row || row.source_type !== "session") {
       throw new SourceNotFoundError("Unknown session candidate. Use an id returned by list_sessions.");
     }
-    if (row.processing_state === "source_unavailable") {
-      throw new SourceUnavailableError("The selected session source is no longer available.");
-    }
-    const adapter = this.sessionAdapters.find((candidate) => candidate.agent === row.agent);
+    if (row.disposition === "excluded") throw new SourceUnavailableError("Restore the excluded Session before indexing it.");
+    const agent = row.agent;
+    const adapter = this.sessionAdapters.find((candidate) => candidate.agent === agent);
     if (!adapter) {
       throw new Error(`No session adapter is registered for ${row.agent}.`);
     }
+    row = await this.refreshSource(row, adapter);
     if (row.processing_state === "indexed" && row.indexed_fingerprint === row.content_fingerprint) {
       const fragmentCount = (this.database.prepare("SELECT count(*) AS count FROM fragments WHERE source_id = ?").get(row.id) as { count: number }).count;
-      return { candidateId, fragmentCount, sourcePath: row.source_path };
+      return { candidateId, fragmentCount, sourcePath: row.source_path, disposition: row.disposition, admissionReason: row.admission_reason ?? undefined };
     }
-    const fragmentCount = await this.indexSource(row, adapter, "selected");
-    return { candidateId, fragmentCount, sourcePath: row.source_path };
+    const fragmentCount = await this.indexSource(row, adapter, "selected", generateEmbeddings);
+    const current = this.getSource(candidateId)!;
+    return { candidateId, fragmentCount, sourcePath: row.source_path, disposition: current.disposition, admissionReason: current.admission_reason ?? undefined };
   }
 
   excludeSession(candidateId: string): { candidateId: string; disposition: "excluded" } {
@@ -230,14 +256,14 @@ export class SourceService {
       return { candidateId, disposition: "excluded" };
     }
     this.database.transaction(() => {
-      this.database.prepare("DELETE FROM fragment_search WHERE fragment_id IN (SELECT id FROM fragments WHERE source_id = ?)").run(row.id);
-      this.database.prepare("DELETE FROM fragments WHERE source_id = ?").run(row.id);
+      this.capacity.removeFragments(row.id);
       this.database.prepare(`
         UPDATE sources
         SET disposition = 'excluded', processing_state = CASE
           WHEN processing_state = 'source_unavailable' THEN 'source_unavailable'
           ELSE 'discovered'
-        END, indexed_fingerprint = NULL, error_message = NULL
+        END, indexed_fingerprint = NULL, error_message = NULL, admission_reason = NULL, retry_after = NULL,
+        embedding_state = 'disabled', embedding_model_id = NULL, embedding_error = NULL
         WHERE id = ?
       `).run(row.id);
       this.database.prepare("INSERT INTO source_audit (source_id, action, created_at) VALUES (?, 'excluded', ?)")
@@ -246,18 +272,18 @@ export class SourceService {
     return { candidateId, disposition: "excluded" };
   }
 
-  async restoreSession(candidateId: string): Promise<{ candidateId: string; fragmentCount: number; sourcePath: string }> {
+  async restoreSession(candidateId: string, generateEmbeddings = true): Promise<SessionIndexResult> {
     const row = this.getSource(candidateId);
     if (!row || row.source_type !== "session") {
       throw new SourceNotFoundError();
     }
-    if (row.processing_state === "source_unavailable") {
-      throw new SourceUnavailableError("The excluded session source is no longer available.");
-    }
-    this.database.prepare("UPDATE sources SET disposition = 'selected', processing_state = 'source_changed' WHERE id = ?").run(row.id);
+    const adapter = this.sessionAdapters.find((candidate) => candidate.agent === row.agent);
+    if (!adapter) throw new SourceUnavailableError("No adapter is available for this Session.");
+    await this.refreshSource(row, adapter);
+    this.database.prepare("UPDATE sources SET disposition = 'discovered', processing_state = 'source_changed', retry_after = NULL WHERE id = ?").run(row.id);
     this.database.prepare("INSERT INTO source_audit (source_id, action, created_at) VALUES (?, 'restored', ?)")
       .run(row.id, new Date().toISOString());
-    return this.indexSession(candidateId);
+    return this.indexSession(candidateId, generateEmbeddings);
   }
 
   listDiagnostics(input: { limit: number; sourceId?: string }): { diagnostics: Array<Record<string, unknown>> } {
@@ -293,15 +319,20 @@ export class SourceService {
       embeddingModelId: this.embeddingProvider?.modelId,
       fragments,
       processing: Object.fromEntries(processingRows.map((row) => [row.state, row.count])),
+      sessionCapacity: this.capacity.status(),
     };
   }
 
-  async retryFailedEmbeddings(): Promise<{ attempted: number; failed: number; indexed: number }> {
+  async retryFailedEmbeddings(generateEmbeddings = true): Promise<{ attempted: number; failed: number; indexed: number }> {
     if (!this.embeddingProvider) throw new Error("Embedding search is not configured.");
     const rows = this.database.prepare(`
       SELECT id FROM sources WHERE embedding_state = 'failed' AND processing_state = 'indexed'
     `).all() as Array<{ id: string }>;
     let indexed = 0;
+    if (!generateEmbeddings) {
+      this.database.prepare("UPDATE sources SET retry_after = NULL, embedding_state = 'pending' WHERE embedding_state = 'failed' AND processing_state = 'indexed'").run();
+      return { attempted: rows.length, failed: 0, indexed: 0 };
+    }
     for (const row of rows) {
       await this.ensureEmbeddings(row.id);
       const state = (this.database.prepare("SELECT embedding_state AS state FROM sources WHERE id = ?").get(row.id) as { state: string }).state;
@@ -368,82 +399,195 @@ export class SourceService {
   }
 
   async scanSources(): Promise<SourceScanResult> {
-    const result: SourceScanResult = { failed: 0, indexed: 0, memories: 0, sessions: 0, unavailable: 0 };
-    for (const adapter of this.sessionAdapters) {
-      const checkpoint = this.beginAdapterScan(adapter.key);
-      let completed = false;
-      try {
-        for await (const source of adapter.discover({ after: checkpoint.cursor })) {
-          const id = this.upsertDiscoveredSource(source, "discovered", checkpoint.scanId);
-          this.advanceAdapterScan(adapter.key, source.discoveryCursor ?? source.sourcePath);
-          const row = this.getSource(id)!;
-          if (row.disposition === "selected" && (row.processing_state !== "indexed" || row.indexed_fingerprint !== row.content_fingerprint)) {
-            try {
-              await this.indexSource(row, adapter, "selected");
-              result.indexed += 1;
-            } catch {
-              result.failed += 1;
-            }
-          } else if (row.disposition === "selected" && row.processing_state === "indexed" && this.embeddingNeedsWork(row)) {
-            await this.ensureEmbeddings(row.id);
-          }
-        }
-        completed = true;
-      } catch (error) {
-        result.failed += 1;
-        this.recordDiscoveryFailure(`${adapter.agent}_session_discovery_failed`, error);
-      } finally {
-        this.recordAdapterDiagnostics(adapter);
-      }
-      if (completed) {
-        const completedResult = this.completeAdapterScan(adapter, "session", checkpoint.scanId);
-        result.sessions += completedResult.seen;
-        result.unavailable += completedResult.unavailable;
-      }
+    const steps = this.scanSteps();
+    for (;;) {
+      const step = await steps.next();
+      if (step.done) return step.value;
+      await new Promise<void>((resolve) => setImmediate(resolve));
     }
+  }
 
-    for (const adapter of this.memoryAdapters) {
+  async *scanSteps(): AsyncGenerator<SourceScanResult, SourceScanResult> {
+    this.scanStartedAt = new Date().toISOString();
+    const result: SourceScanResult = { failed: 0, indexed: 0, memories: 0, sessions: 0, unavailable: 0 };
+    if (this.firstScan) {
+      this.database.prepare("UPDATE sources SET retry_after = NULL WHERE processing_state = 'failed' OR embedding_state = 'failed'").run();
+      this.firstScan = false;
+    }
+    const adapters = [...this.sessionAdapters, ...this.memoryAdapters];
+    const activeKeys = new Set(adapters.map((adapter) => adapter.key));
+    for (const row of this.database.prepare("SELECT adapter_key FROM scan_checkpoints").all() as Array<{ adapter_key: string }>) {
+      if (!activeKeys.has(row.adapter_key)) this.database.prepare("DELETE FROM scan_checkpoints WHERE adapter_key = ?").run(row.adapter_key);
+    }
+    for (const _step of this.capacity.trimSteps()) yield result;
+    const jobs = adapters.map((adapter) => {
       const checkpoint = this.beginAdapterScan(adapter.key);
-      let completed = false;
-      try {
-        for await (const source of adapter.discover({ after: checkpoint.cursor })) {
-          const id = this.upsertDiscoveredSource(source, "selected", checkpoint.scanId);
-          this.advanceAdapterScan(adapter.key, source.discoveryCursor ?? source.sourcePath);
-          const row = this.getSource(id)!;
-          if (row.processing_state !== "indexed" || row.indexed_fingerprint !== row.content_fingerprint) {
-            try {
-              await this.indexSource(row, adapter, "selected");
-              result.indexed += 1;
-            } catch {
-              result.failed += 1;
+      const sourceType: SourceType = this.sessionAdapters.includes(adapter as SessionSourceAdapter) ? "session" : "memory";
+      const cache = discoveryCache(this.database, adapter.key, `${INDEX_RULE_VERSION}:${SENSITIVE_CONTENT_RULE_VERSION}`, this.scanStartedAt);
+      const options = { after: checkpoint.cursor, cache };
+      const iterator = adapter.discoverSteps ? adapter.discoverSteps(options)[Symbol.asyncIterator]()
+        : (async function* (): AsyncGenerator<SourceDiscoveryStep> {
+          for await (const source of adapter.discover(options)) yield { source, cursor: source.discoveryCursor ?? source.sourcePath };
+        })();
+      return { adapter, checkpoint, sourceType, iterator, cache, done: false, complete: true };
+    });
+    try {
+      while (jobs.some((job) => !job.done)) {
+        for (const job of jobs) {
+          if (job.done) continue;
+          try {
+            const next = await job.iterator.next();
+            if (next.done) {
+              job.done = true;
+              if (job.complete) {
+                const counts = yield* this.completeScanSteps(job.adapter, job.sourceType, job.checkpoint.scanId, result);
+                result[job.sourceType === "session" ? "sessions" : "memories"] += counts;
+              }
+            } else {
+              if (next.value.complete === false) job.complete = false;
+              this.database.transaction(() => {
+                job.cache.flush();
+                const id = next.value.source ? this.upsertDiscoveredSource(next.value.source,
+                  job.sourceType === "memory" ? "selected" : "discovered", job.checkpoint.scanId) : undefined;
+                if (next.value.cursor) this.advanceAdapterScan(job.adapter.key, next.value.cursor);
+                if (id && job.sourceType === "session") {
+                  const row = this.getSource(id)!;
+                  if (row.disposition !== "excluded" && !this.capacity.canFit(id, row.session_fragment_count ?? 1)) {
+                    this.capacity.defer(id, (row.session_fragment_count ?? 1) > this.capacity.limit(row.agent) ? "oversized" : "capacity");
+                  }
+                }
+              })();
             }
-          } else if (this.embeddingNeedsWork(row)) {
-            await this.ensureEmbeddings(row.id);
+          } catch (error) {
+            job.done = true;
+            result.failed += 1;
+            this.recordDiscoveryFailure(`${job.adapter.agent}_${job.sourceType}_discovery_failed`, error);
           }
+          this.recordAdapterDiagnostics(job.adapter, false);
+          yield result;
         }
-        completed = true;
-      } catch (error) {
-        result.failed += 1;
-        this.recordDiscoveryFailure(`${adapter.agent}_memory_discovery_failed`, error);
-      } finally {
-        this.recordAdapterDiagnostics(adapter);
       }
-      if (completed) {
-        const completedResult = this.completeAdapterScan(adapter, "memory", checkpoint.scanId);
-        result.memories += completedResult.seen;
-        result.unavailable += completedResult.unavailable;
+      // Reconsider waiting/changed sources after discovering newer priorities and freed capacity.
+      const cursors = new Map<string, { time: string; id: string }>();
+      let progress = true;
+      while (progress) {
+        progress = false;
+        for (const adapter of adapters) {
+          const cursor = cursors.get(adapter.key);
+          const row = this.nextPendingSource(adapter, cursor);
+          if (!row) continue;
+          cursors.set(adapter.key, { time: row.source_updated_at, id: row.id });
+          progress = true;
+          const indexed = await this.processSource(row.id, adapter, result, true);
+          yield result;
+          if (indexed && this.embeddingProvider) { await this.embeddings.batch(row.id); yield result; }
+        }
+      }
+      const agents = [...new Set(adapters.map((adapter) => adapter.agent))];
+      while (agents.some((agent) => this.nextEmbedding(agent) !== undefined)) {
+        for (const agent of agents) {
+          const id = this.nextEmbedding(agent);
+          if (id) { await this.embeddings.batch(id); yield result; }
+        }
+      }
+      const memoryAgents = new Set(this.memoryAdapters.map((adapter) => adapter.agent));
+      let memoryCursor = "";
+      for (;;) {
+        const rows = this.database.prepare("SELECT id, agent FROM sources WHERE source_type = 'memory' AND processing_state <> 'source_unavailable' AND id > ? ORDER BY id LIMIT 100")
+          .all(memoryCursor) as Array<{ agent: string; id: string }>;
+        if (rows.length === 0) break;
+        for (const row of rows) if (!memoryAgents.has(row.agent)) { this.markSourceUnavailable(row.id); result.unavailable += 1; }
+        memoryCursor = rows.at(-1)!.id;
+        yield result;
+      }
+      this.pruneDiagnostics();
+      return result;
+    } finally {
+      for (const job of jobs) {
+        await job.iterator.return?.();
+        this.recordAdapterDiagnostics(job.adapter, false);
       }
     }
-    const activeMemoryAgents = new Set(this.memoryAdapters.map((adapter) => adapter.agent));
-    const memoryRows = this.database.prepare("SELECT id, agent, processing_state FROM sources WHERE source_type = 'memory'").all() as Array<{ agent: string; id: string; processing_state: string }>;
-    for (const row of memoryRows) {
-      if (!activeMemoryAgents.has(row.agent) && row.processing_state !== "source_unavailable") {
+  }
+
+  private nextPendingSource(adapter: SourceAdapter, cursor?: { time: string; id: string }) {
+    const sourceType = this.sessionAdapters.includes(adapter as SessionSourceAdapter) ? "session" : "memory";
+    const base = `SELECT id, source_updated_at FROM sources WHERE source_type = ? AND agent = ?
+      AND disposition <> 'excluded' AND processing_state <> 'source_unavailable'
+      AND (processing_state <> 'indexed' OR indexed_fingerprint IS NOT content_fingerprint)`;
+    type Pending = { id: string; source_updated_at: string } | undefined;
+    if (cursor) {
+      const sameTime = this.database.prepare(`${base} AND source_updated_at = ? AND id > ? ORDER BY id LIMIT 1`)
+        .get(sourceType, adapter.agent, cursor.time, cursor.id) as Pending;
+      if (sameTime) return sameTime;
+      return this.database.prepare(`${base} AND source_updated_at < ? ORDER BY source_updated_at DESC, id LIMIT 1`)
+        .get(sourceType, adapter.agent, cursor.time) as Pending;
+    }
+    return this.database.prepare(`${base} ORDER BY source_updated_at DESC, id LIMIT 1`).get(sourceType, adapter.agent) as Pending;
+  }
+
+  private nextEmbedding(agent: string): string | undefined {
+    if (!this.embeddingProvider) return undefined;
+    return (this.database.prepare(`SELECT id FROM sources WHERE agent = ? AND disposition = 'selected'
+      AND processing_state = 'indexed' AND (embedding_state <> 'indexed' OR embedding_model_id IS NOT ?)
+      AND (retry_after IS NULL OR retry_after <= ?) ORDER BY source_updated_at DESC, id LIMIT 1`)
+      .get(agent, this.embeddingProvider.modelId, new Date().toISOString()) as { id: string } | undefined)?.id;
+  }
+
+  private async processSource(id: string, adapter: SourceAdapter, result: SourceScanResult, refresh = false): Promise<boolean> {
+    let row = this.getSource(id)!;
+    if (row.disposition === "excluded" || row.processing_state === "source_unavailable"
+      || (row.retry_after && row.retry_after > new Date().toISOString())) return false;
+    if (row.processing_state === "indexed" && row.indexed_fingerprint === row.content_fingerprint) return false;
+    if (row.source_type === "session") {
+      const estimate = row.session_fragment_count ?? 1;
+      if (!this.capacity.canFit(id, estimate)) {
+        this.capacity.defer(id, estimate > this.capacity.limit(row.agent) ? "oversized" : "capacity");
+        return false;
+      }
+    }
+    try {
+      if (refresh) row = await this.refreshSource(row, adapter);
+      const count = await this.indexSource(row, adapter, "selected", false);
+      if (count > 0) result.indexed += 1;
+      return count > 0;
+    } catch { result.failed += 1; return false; }
+  }
+
+  private async refreshSource(row: SourceRow, adapter: SourceAdapter): Promise<SourceRow> {
+    if (adapter.refresh) {
+      const source = await adapter.refresh(rowToReference(row));
+      if (!source) {
         this.markSourceUnavailable(row.id);
-        result.unavailable += 1;
+        throw new SourceUnavailableError("The Session source is unavailable or no longer contains eligible content.");
+      }
+      this.upsertDiscoveredSource(source, row.disposition === "selected" ? "selected" : "discovered", row.last_seen_scan_id ?? "refresh");
+    }
+    const current = this.getSource(row.id)!;
+    if (current.processing_state === "source_unavailable") throw new SourceUnavailableError();
+    return current;
+  }
+
+  private async *completeScanSteps(adapter: SourceAdapter, sourceType: SourceType, scanId: string, result: SourceScanResult): AsyncGenerator<SourceScanResult, number> {
+    for (;;) {
+      const rows = this.database.prepare(`SELECT id FROM sources WHERE source_type = ? AND agent = ?
+        AND last_seen_scan_id IS NOT ? AND processing_state <> 'source_unavailable' LIMIT 100`)
+        .all(sourceType, adapter.agent, scanId) as Array<{ id: string }>;
+      if (rows.length === 0) break;
+      for (const row of rows) {
+        if (adapter.isAvailable && await adapter.isAvailable(rowToReference(this.getSource(row.id)!))) {
+          this.database.prepare("UPDATE sources SET last_seen_scan_id = ?, processing_state = 'source_changed' WHERE id = ?").run(scanId, row.id);
+        } else { this.markSourceUnavailable(row.id); result.unavailable += 1; }
+        yield result;
       }
     }
-    this.pruneDiagnostics();
-    return result;
+    const { count } = this.database.prepare("SELECT count(*) AS count FROM sources WHERE source_type = ? AND agent = ? AND last_seen_scan_id = ?")
+      .get(sourceType, adapter.agent, scanId) as { count: number };
+    this.database.prepare(`UPDATE scan_diagnostics SET resolved_at = ? WHERE adapter_key = ? AND resolved_at IS NULL
+      AND last_seen_at < (SELECT started_at FROM scan_checkpoints WHERE adapter_key = ?)`)
+      .run(new Date().toISOString(), adapter.key, adapter.key);
+    this.database.prepare("DELETE FROM scan_checkpoints WHERE adapter_key = ? AND scan_id = ?").run(adapter.key, scanId);
+    return count;
   }
 
   private beginAdapterScan(adapterKey: string): { cursor?: string; scanId: string } {
@@ -458,19 +602,6 @@ export class SourceService {
 
   private advanceAdapterScan(adapterKey: string, cursor: string): void {
     this.database.prepare("UPDATE scan_checkpoints SET cursor = ? WHERE adapter_key = ?").run(cursor, adapterKey);
-  }
-
-  private completeAdapterScan(adapter: SourceAdapter, sourceType: SourceType, scanId: string): { seen: number; unavailable: number } {
-    const missing = this.database.prepare(`
-      SELECT id FROM sources
-      WHERE source_type = ? AND agent = ? AND last_seen_scan_id IS NOT ? AND processing_state <> 'source_unavailable'
-    `).all(sourceType, adapter.agent, scanId) as Array<{ id: string }>;
-    for (const row of missing) this.markSourceUnavailable(row.id);
-    const seen = (this.database.prepare(`
-      SELECT count(*) AS count FROM sources WHERE source_type = ? AND agent = ? AND last_seen_scan_id = ?
-    `).get(sourceType, adapter.agent, scanId) as { count: number }).count;
-    this.database.prepare("DELETE FROM scan_checkpoints WHERE adapter_key = ? AND scan_id = ?").run(adapter.key, scanId);
-    return { seen, unavailable: missing.length };
   }
 
   private pruneDiagnostics(): void {
@@ -489,10 +620,10 @@ export class SourceService {
     `).run(code, message, new Date().toISOString());
   }
 
-  private recordAdapterDiagnostics(adapter: SourceAdapter): void {
+  private recordAdapterDiagnostics(adapter: SourceAdapter, resolve = true): void {
     const diagnostics = adapter.takeDiagnostics?.() ?? [];
     const now = new Date().toISOString();
-    this.database.prepare("UPDATE scan_diagnostics SET resolved_at = ? WHERE adapter_key = ? AND resolved_at IS NULL")
+    if (resolve) this.database.prepare("UPDATE scan_diagnostics SET resolved_at = ? WHERE adapter_key = ? AND resolved_at IS NULL")
       .run(now, adapter.key);
     if (diagnostics.length === 0) return;
     const insert = this.database.prepare(`
@@ -508,7 +639,7 @@ export class SourceService {
     `);
     const refresh = this.database.prepare(`
       UPDATE scan_diagnostics
-      SET source_id = ?, level = ?, adapter_key = ?, occurrence_count = occurrence_count + 1,
+      SET source_id = ?, level = ?, adapter_key = ?, occurrence_count = occurrence_count + CASE WHEN last_seen_at < ? THEN 1 ELSE 0 END,
           last_seen_at = ?, resolved_at = NULL
       WHERE source_path IS ? AND code = ? AND message = ?
     `);
@@ -533,7 +664,7 @@ export class SourceService {
           diagnostic.message,
         );
         if (result.changes === 0) {
-          refresh.run(sourceId, diagnostic.level, adapter.key, now, diagnostic.sourcePath ?? null, diagnostic.code, diagnostic.message);
+          refresh.run(sourceId, diagnostic.level, adapter.key, this.scanStartedAt, now, diagnostic.sourcePath ?? null, diagnostic.code, diagnostic.message);
         }
         if (result.changes > 0 && sourceId && diagnostic.code === "sensitive_content_redacted") {
           audit.run(sourceId, "sensitive_content_redacted", now);
@@ -545,6 +676,8 @@ export class SourceService {
   private markSourceUnavailable(sourceId: string): void {
     const now = new Date().toISOString();
     this.database.transaction(() => {
+      const row = this.getSource(sourceId)!;
+      if (row.source_type === "session") this.capacity.removeFragments(sourceId);
       this.database.prepare("UPDATE sources SET processing_state = 'source_unavailable' WHERE id = ?").run(sourceId);
       this.database.prepare(`
         INSERT INTO scan_diagnostics (source_id, level, code, message, created_at)
@@ -575,6 +708,13 @@ export class SourceService {
         content_fingerprint = excluded.content_fingerprint,
         source_updated_at = excluded.source_updated_at,
         last_seen_at = excluded.last_seen_at,
+        session_fragment_count = CASE WHEN sources.content_fingerprint IS NOT excluded.content_fingerprint
+          OR sources.index_rule_version <> excluded.index_rule_version OR sources.security_rule_version <> excluded.security_rule_version
+          THEN NULL ELSE sources.session_fragment_count END,
+        admission_reason = CASE WHEN sources.content_fingerprint IS NOT excluded.content_fingerprint
+          OR sources.index_rule_version <> excluded.index_rule_version OR sources.security_rule_version <> excluded.security_rule_version
+          THEN NULL ELSE sources.admission_reason END,
+        retry_after = CASE WHEN sources.content_fingerprint IS NOT excluded.content_fingerprint THEN NULL ELSE sources.retry_after END,
         processing_state = CASE
           WHEN sources.disposition = 'selected' AND sources.indexed_fingerprint IS NOT excluded.content_fingerprint THEN 'source_changed'
           WHEN sources.disposition = 'selected' AND sources.index_rule_version <> excluded.index_rule_version THEN 'source_changed'
@@ -611,8 +751,8 @@ export class SourceService {
     return this.database.prepare("SELECT * FROM sources WHERE id = ?").get(id) as SourceRow | undefined;
   }
 
-  private async indexSource(row: SourceRow, adapter: SourceAdapter, disposition: "selected"): Promise<number> {
-    this.database.prepare("UPDATE sources SET disposition = ?, processing_state = 'indexing', error_message = NULL WHERE id = ?").run(disposition, row.id);
+  private async indexSource(row: SourceRow, adapter: SourceAdapter, disposition: "selected", generateEmbeddings = true): Promise<number> {
+    this.database.prepare("UPDATE sources SET processing_state = 'indexing', error_message = NULL WHERE id = ?").run(row.id);
     const reference = rowToReference(row);
     const documents: IndexDocument[] = [];
     try {
@@ -625,6 +765,9 @@ export class SourceService {
         throw new Error("Source contains no visible indexable text.");
       }
       const replace = this.database.transaction(() => {
+        const current = this.getSource(row.id)!;
+        if (current.disposition === "excluded" || current.content_fingerprint !== row.content_fingerprint) return false;
+        if (row.source_type === "session" && !this.capacity.admit(row.id, documents.length)) return false;
         const reusableEmbeddings = this.database.prepare(`
           SELECT input_hash, model_id, dimensions, embedding
           FROM fragment_embeddings
@@ -635,13 +778,12 @@ export class SourceService {
           `${embedding.model_id}\0${embedding.input_hash}`,
           embedding,
         ]));
-        this.database.prepare("DELETE FROM fragment_search WHERE fragment_id IN (SELECT id FROM fragments WHERE source_id = ?)").run(row.id);
-        this.database.prepare("DELETE FROM fragments WHERE source_id = ?").run(row.id);
+        this.capacity.removeFragments(row.id);
         const insertFragment = this.database.prepare(`
           INSERT INTO fragments (
             id, source_id, content_hash, ordinal, role, location, end_location,
-            started_at, ended_at, turn_count, chunk_index, content_tokens, title, body
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            started_at, ended_at, turn_count, chunk_index, content_tokens, title, body, embedding_input_hash, search_rowid
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `);
         const insertSearch = this.database.prepare("INSERT INTO fragment_search (fragment_id, title_terms, body_terms) VALUES (?, ?, ?)");
         const insertEmbedding = this.database.prepare(`
@@ -651,6 +793,7 @@ export class SourceService {
         documents.forEach((document, index) => {
           const contentHash = digest(normalizeSearchText(document.body));
           const fragmentId = digest(`${row.id}\0${document.location}\0${index}\0${contentHash}`);
+          const searchRowid = insertSearch.run(fragmentId, buildSearchTerms(document.title ?? ""), buildSearchTerms(document.searchText ?? document.body)).lastInsertRowid;
           insertFragment.run(
             fragmentId,
             row.id,
@@ -666,10 +809,11 @@ export class SourceService {
             document.contentTokenCount ?? null,
             document.title ?? null,
             document.body,
+            digest(embeddingInput(document)),
+            searchRowid,
           );
-          insertSearch.run(fragmentId, buildSearchTerms(document.title ?? ""), buildSearchTerms(document.searchText ?? document.body));
           if (this.embeddingProvider) {
-            const inputHash = digest(this.embeddingInput(document));
+            const inputHash = digest(embeddingInput(document));
             const reusable = reusableByInput.get(`${this.embeddingProvider.modelId}\0${inputHash}`);
             if (reusable) {
               insertEmbedding.run(fragmentId, reusable.model_id, reusable.dimensions, reusable.embedding, inputHash);
@@ -680,7 +824,7 @@ export class SourceService {
           UPDATE sources
           SET disposition = ?, processing_state = 'indexed', indexed_fingerprint = content_fingerprint,
               error_message = NULL, index_rule_version = ?, security_rule_version = ?, embedding_state = ?,
-              embedding_model_id = ?, embedding_error = NULL
+              embedding_model_id = ?, embedding_error = NULL, retry_after = NULL
           WHERE id = ?
         `).run(
           disposition,
@@ -692,15 +836,16 @@ export class SourceService {
         );
         this.database.prepare("INSERT INTO source_audit (source_id, action, created_at) VALUES (?, ?, ?)")
           .run(row.id, row.indexed_fingerprint ? "reindexed" : "indexed", new Date().toISOString());
+        return true;
       });
-      replace();
-      await this.ensureEmbeddings(row.id);
+      if (!replace()) return 0;
+      if (generateEmbeddings) await this.ensureEmbeddings(row.id);
       return documents.length;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.database.transaction(() => {
-        this.database.prepare("UPDATE sources SET disposition = ?, processing_state = 'failed', error_message = ? WHERE id = ?")
-          .run(disposition, message, row.id);
+        this.database.prepare("UPDATE sources SET processing_state = 'failed', error_message = ?, retry_after = ? WHERE id = ? AND disposition <> 'excluded'")
+          .run(message, new Date(Date.now() + 60_000).toISOString(), row.id);
         this.database.prepare(`
           INSERT INTO scan_diagnostics (source_id, level, code, message, created_at)
           VALUES (?, 'error', 'index_failed', ?, ?)
@@ -710,93 +855,10 @@ export class SourceService {
     }
   }
 
-  private embeddingInput(document: Pick<IndexDocument, "body" | "title">): string {
-    return `${document.title ? `${document.title}\n` : ""}${document.body}`;
-  }
-
-  private embeddingNeedsWork(row: SourceRow): boolean {
-    return this.embeddingProvider !== undefined && (
-      row.embedding_state !== "indexed" || row.embedding_model_id !== this.embeddingProvider.modelId
-    );
-  }
-
   private async ensureEmbeddings(sourceId: string): Promise<void> {
-    if (!this.embeddingProvider) return;
-    const provider = this.embeddingProvider;
-    const rows = this.database.prepare(`
-      SELECT f.id, f.title, f.body, e.model_id, e.input_hash
-      FROM fragments f
-      LEFT JOIN fragment_embeddings e ON e.fragment_id = f.id
-      WHERE f.source_id = ?
-      ORDER BY f.ordinal
-    `).all(sourceId) as Array<{
-      body: string;
-      id: string;
-      input_hash: string | null;
-      model_id: string | null;
-      title: string | null;
-    }>;
-    const missing = rows.flatMap((row) => {
-      const input = this.embeddingInput({ body: row.body, title: row.title ?? undefined });
-      const inputHash = digest(input);
-      return row.model_id === provider.modelId && row.input_hash === inputHash
-        ? []
-        : [{ id: row.id, input, inputHash }];
-    });
-    if (missing.length === 0) {
-      this.database.prepare(`
-        UPDATE sources SET embedding_state = 'indexed', embedding_model_id = ?, embedding_error = NULL
-        WHERE id = ?
-      `).run(provider.modelId, sourceId);
-      return;
-    }
-    this.database.prepare(`
-      UPDATE sources SET embedding_state = 'indexing', embedding_model_id = ?, embedding_error = NULL
-      WHERE id = ?
-    `).run(provider.modelId, sourceId);
-    try {
-      for (let offset = 0; offset < missing.length; offset += 16) {
-        const batch = missing.slice(offset, offset + 16);
-        const embeddings = await provider.embedPassages(batch.map((item) => item.input));
-        if (embeddings.length !== batch.length || embeddings.some((embedding) => (
-          embedding.length === 0 || ![...embedding].every(Number.isFinite)
-        ))) {
-          throw new Error("The embedding model returned invalid fragment vectors.");
-        }
-        const insert = this.database.prepare(`
-          INSERT INTO fragment_embeddings (fragment_id, model_id, dimensions, embedding, input_hash)
-          VALUES (?, ?, ?, ?, ?)
-          ON CONFLICT(fragment_id) DO UPDATE SET
-            model_id = excluded.model_id,
-            dimensions = excluded.dimensions,
-            embedding = excluded.embedding,
-            input_hash = excluded.input_hash
-        `);
-        this.database.transaction(() => {
-          batch.forEach((item, index) => {
-            const embedding = embeddings[index]!;
-            insert.run(item.id, provider.modelId, embedding.length, encodeEmbedding(embedding), item.inputHash);
-          });
-        })();
-      }
-      this.database.prepare(`
-        UPDATE sources SET embedding_state = 'indexed', embedding_model_id = ?, embedding_error = NULL
-        WHERE id = ?
-      `).run(provider.modelId, sourceId);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      this.database.transaction(() => {
-        this.database.prepare(`
-          UPDATE sources SET embedding_state = 'failed', embedding_model_id = ?, embedding_error = ?
-          WHERE id = ?
-        `).run(provider.modelId, message, sourceId);
-        this.database.prepare(`
-          INSERT INTO scan_diagnostics (source_id, level, code, message, created_at)
-          VALUES (?, 'warning', 'embedding_failed', ?, ?)
-        `).run(sourceId, message, new Date().toISOString());
-      })();
-    }
+    await this.embeddings.complete(sourceId);
   }
+
 }
 
 export function createSourceService(
@@ -809,6 +871,7 @@ export function createSourceService(
     reranker?: RerankerProvider;
     isRerankerEnabled?: () => boolean;
     rerankCandidateCount?: number;
+    sessionFragmentLimits?: Readonly<Record<string, number>>;
   } = {},
 ): SourceService {
   return new SourceService(database, {
@@ -819,5 +882,6 @@ export function createSourceService(
     reranker: options.reranker,
     isRerankerEnabled: options.isRerankerEnabled,
     rerankCandidateCount: options.rerankCandidateCount,
+    sessionFragmentLimits: options.sessionFragmentLimits,
   });
 }

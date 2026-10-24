@@ -5,6 +5,7 @@ export interface FragmentRow {
   body: string;
   chunk_index: number | null;
   content_fingerprint: string;
+  content_hash: string;
   content_tokens: number | null;
   embedding?: Buffer;
   end_location: string | null;

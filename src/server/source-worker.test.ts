@@ -24,6 +24,79 @@ function serviceWith(overrides: Record<string, unknown> = {}) {
 }
 
 describe("source worker", () => {
+  it("runs mutations between scan steps and closes an unfinished scan on stop", async () => {
+    const events: string[] = [];
+    const service = { ...serviceWith(),
+      excludeSession: vi.fn(() => { events.push("excluded"); return { candidateId: "candidate", disposition: "excluded" as const }; }),
+      scanSteps: vi.fn(async function* () {
+        try {
+          events.push("step");
+          yield { failed: 0, indexed: 0, memories: 0, sessions: 0, unavailable: 0 };
+          for (;;) { events.push("step"); yield { failed: 0, indexed: 0, memories: 0, sessions: 0, unavailable: 0 }; }
+        } finally { events.push("closed"); }
+      }),
+    };
+    const worker = new SourceWorker(service, { intervalMs: 0 });
+    const scan = worker.scanNow();
+    await worker.excludeSession("candidate");
+    await worker.stop();
+    await scan;
+    expect(service.scanSteps).toHaveBeenCalledOnce();
+    expect(service.scanSources).not.toHaveBeenCalled();
+    expect(events.indexOf("excluded")).toBeLessThan(events.indexOf("closed"));
+    expect(events.filter((event) => event === "step").length).toBeLessThanOrEqual(2);
+  });
+
+  it("completes a fresh scan after rebuild mutates an already-scanned source", async () => {
+    const ready = deferred();
+    let dirty = false;
+    let scans = 0;
+    const result = { failed: 0, indexed: 0, memories: 0, sessions: 0, unavailable: 0 };
+    const service = { ...serviceWith(),
+      prepareRebuild: vi.fn(() => { dirty = true; return 1; }),
+      scanSteps: vi.fn(async function* () {
+        scans += 1;
+        dirty = false;
+        ready.resolve();
+        yield { ...result };
+        return { ...result };
+      }),
+    };
+    const worker = new SourceWorker(service, { intervalMs: 0 });
+    const scan = worker.scanNow();
+    await ready.promise;
+    try {
+      expect((await worker.rebuild()).queuedSources).toBe(1);
+      await scan;
+      expect(scans).toBeGreaterThanOrEqual(2);
+      expect(dirty).toBe(false);
+    } finally { await worker.stop(); }
+  });
+
+  it("keeps periodic retries active after an initial background scan failure", async () => {
+    let attempts = 0;
+    const retried = deferred();
+    const result = { failed: 0, indexed: 0, memories: 0, sessions: 0, unavailable: 0 };
+    const service = { ...serviceWith(), scanSteps: vi.fn(async function* () {
+      attempts += 1;
+      if (attempts === 1) throw new Error("transient scan failure");
+      retried.resolve();
+      return { ...result };
+    }) };
+    const worker = new SourceWorker(service, { intervalMs: 5 });
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await expect(worker.start()).rejects.toThrow("transient scan failure");
+      await Promise.race([retried.promise, new Promise<void>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error("Periodic scan did not retry.")), 500);
+      })]);
+      expect(attempts).toBeGreaterThanOrEqual(2);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      await worker.stop();
+    }
+  });
+
   it("recovers interrupted sources and completes an initial scan", async () => {
     const service = serviceWith({
       recoverInterrupted: vi.fn(() => 2),

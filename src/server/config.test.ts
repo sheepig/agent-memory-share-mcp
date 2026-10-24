@@ -5,7 +5,6 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { configPath, defaultDaemonConfig, initializeDaemonConfig, readDaemonConfig, writeDaemonConfig } from "./config.js";
-import { RotatingLogStream } from "./rotating-log.js";
 import { readRuntime, removeRuntime, writeRuntime } from "./runtime-state.js";
 
 const temporaryDirectories: string[] = [];
@@ -21,6 +20,7 @@ describe("daemon files", () => {
 
     expect(initializeDaemonConfig(directory)).toEqual(defaultDaemonConfig);
     expect(writeDaemonConfig(directory, { host: "::1", port: 45_000, scanIntervalSeconds: 0 })).toEqual({
+      ...defaultDaemonConfig,
       host: "::1",
       port: 45_000,
       rerankerEnabled: false,
@@ -42,6 +42,53 @@ describe("daemon files", () => {
     expect(() => readDaemonConfig(directory)).toThrow();
   });
 
+  it("materializes source paths for legacy files and preserves edits when saving search settings", async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "agent-memory-source-config-"));
+    temporaryDirectories.push(directory);
+    await fs.writeFile(configPath(directory), JSON.stringify({ host: "127.0.0.1", port: 45_123, scanIntervalSeconds: 0 }));
+
+    initializeDaemonConfig(directory);
+    const saved = JSON.parse(await fs.readFile(configPath(directory), "utf8"));
+    expect(saved.sources.codex.sessionRoots).toEqual(["~/.codex/sessions", "~/.codex/archived_sessions"]);
+    saved.sources.codex.memoryRoots = ["~/custom-memories", "/shared/notes.md"];
+    await fs.writeFile(configPath(directory), JSON.stringify(saved));
+    writeDaemonConfig(directory, { ...readDaemonConfig(directory), rerankerEnabled: true });
+    expect(readDaemonConfig(directory)).toMatchObject({
+      port: 45_123, rerankerEnabled: true,
+      sources: { codex: { memoryRoots: ["~/custom-memories", "/shared/notes.md"] } },
+    });
+  });
+
+  it("rejects ambiguous paths and misspelled source options", async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "agent-memory-invalid-sources-"));
+    temporaryDirectories.push(directory);
+    for (const sources of [
+      { codex: { sessionRoots: ["relative/sessions"] } },
+      { codex: { memoryRoots: [""] } },
+      { codex: { memoryRoot: ["/notes"] } },
+      { opencode: { databasePath: "/database\0.db" } },
+    ]) {
+      await fs.writeFile(configPath(directory), JSON.stringify({ ...defaultDaemonConfig, sources }));
+      expect(() => readDaemonConfig(directory)).toThrow();
+    }
+  });
+
+  it("defaults and persists per-agent fragment budgets without a Session count limit", async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "agent-memory-capacity-config-"));
+    temporaryDirectories.push(directory);
+    await fs.writeFile(configPath(directory), JSON.stringify({ ...defaultDaemonConfig, sessionFragmentLimits: undefined }));
+
+    expect(readDaemonConfig(directory).sessionFragmentLimits).toEqual({ codex: 5_000, "claude-code": 5_000, cursor: 5_000, opencode: 5_000 });
+    initializeDaemonConfig(directory);
+    expect(JSON.parse(await fs.readFile(configPath(directory), "utf8")).sessionFragmentLimits.codex).toBe(5_000);
+    writeDaemonConfig(directory, { ...readDaemonConfig(directory), sessionFragmentLimits: { codex: 10_000 } });
+    expect(readDaemonConfig(directory).sessionFragmentLimits).toEqual({ codex: 10_000, "claude-code": 5_000, cursor: 5_000, opencode: 5_000 });
+    for (const value of [0, -1, 1.5, "5000"]) {
+      await fs.writeFile(configPath(directory), JSON.stringify({ ...defaultDaemonConfig, sessionFragmentLimits: { codex: value } }));
+      expect(() => readDaemonConfig(directory)).toThrow();
+    }
+  });
+
   it("writes and removes runtime state only for its owning process", async () => {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), "agent-memory-runtime-"));
     temporaryDirectories.push(directory);
@@ -61,19 +108,5 @@ describe("daemon files", () => {
     expect(readRuntime(directory)).toEqual(runtime);
     removeRuntime(directory, process.pid);
     expect(readRuntime(directory)).toBeUndefined();
-  });
-
-  it("rotates bounded daemon logs", async () => {
-    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "agent-memory-log-"));
-    temporaryDirectories.push(directory);
-    const file = path.join(directory, "daemon.log");
-    const stream = new RotatingLogStream(file, { maxBytes: 8, retainedFiles: 2 });
-
-    stream.write("12345678");
-    stream.write("abcdef");
-    await new Promise<void>((resolve, reject) => stream.end((error?: Error) => error ? reject(error) : resolve()));
-
-    expect(await fs.readFile(file, "utf8")).toBe("abcdef");
-    expect(await fs.readFile(`${file}.1`, "utf8")).toBe("12345678");
   });
 });

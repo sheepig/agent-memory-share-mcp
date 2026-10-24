@@ -7,8 +7,8 @@ import { EmptyState } from "../components/empty-state.js";
 import { ServiceStatus } from "../components/service-status.js";
 import {
   excludeSession,
+  getIndexStatus,
   getSessions,
-  indexSession,
   restoreSession,
   type Agent,
   type SessionCandidate,
@@ -22,8 +22,8 @@ const agentLabels: Record<Agent, string> = {
 };
 
 const dispositionLabels = {
-  discovered: "待选取",
-  excluded: "已排除",
+  discovered: "等待处理",
+  excluded: "已剔除",
   selected: "已参与",
 } as const;
 
@@ -36,7 +36,7 @@ const statusLabels: Record<SessionCandidate["indexStatus"], string> = {
   source_unavailable: "来源不可用",
 };
 
-type SessionOperation = "exclude" | "index" | "restore";
+type SessionOperation = "exclude" | "restore";
 const pageSize = 25;
 
 function formatDate(value: string): string {
@@ -47,9 +47,8 @@ function formatDate(value: string): string {
 }
 
 function actionFor(session: SessionCandidate): { label: string; operation: SessionOperation } {
-  if (session.disposition === "discovered") return { label: "参与索引", operation: "index" };
   if (session.disposition === "excluded") return { label: "恢复", operation: "restore" };
-  return { label: "排除", operation: "exclude" };
+  return { label: "剔除", operation: "exclude" };
 }
 
 export function SessionsPage() {
@@ -65,13 +64,11 @@ export function SessionsPage() {
       offset: page * pageSize,
     }),
     queryKey: ["sessions", agent, disposition, page],
+    refetchInterval: 5_000,
   });
+  const index = useQuery({ queryFn: getIndexStatus, queryKey: ["index-status"], refetchInterval: 5_000 });
   const mutation = useMutation<void, Error, { candidateId: string; operation: SessionOperation }>({
     mutationFn: async ({ candidateId, operation }) => {
-      if (operation === "index") {
-        await indexSession(candidateId);
-        return;
-      }
       if (operation === "restore") {
         await restoreSession(candidateId);
         return;
@@ -81,6 +78,7 @@ export function SessionsPage() {
     onSuccess: async () => {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["sessions"] }),
+        queryClient.invalidateQueries({ queryKey: ["index-status"] }),
         queryClient.invalidateQueries({ queryKey: ["search"] }),
       ]);
     },
@@ -94,7 +92,7 @@ export function SessionsPage() {
       <header className="page-header">
         <div>
           <h1>Sessions</h1>
-          <p>查看哪些会话已经参与检索，并控制本地派生索引。原始来源始终只读。</p>
+          <p>符合资格的会话按 Agent 片段预算自动参与检索，可主动剔除。原始来源始终只读。</p>
         </div>
         <ServiceStatus />
       </header>
@@ -117,17 +115,28 @@ export function SessionsPage() {
             <select aria-label="按参与状态筛选" onChange={(event) => { setDisposition(event.target.value as SessionCandidate["disposition"] | "all"); setPage(0); }} value={disposition}>
               <option value="all">全部</option>
               <option value="selected">已参与</option>
-              <option value="discovered">待选取</option>
-              <option value="excluded">已排除</option>
+              <option value="discovered">等待 / 处理中</option>
+              <option value="excluded">已剔除</option>
             </select>
           </label>
         </div>
       </div>
 
+      {index.data?.sessionCapacity ? (
+        <div aria-label="Agent Session 片段容量" className="summary-line">
+          {Object.entries(index.data.sessionCapacity).filter(([value]) => agent === "all" || agent === value).map(([value, capacity]) => (
+            <span key={value}>
+              {agentLabels[value as Agent]}：{capacity.fragments + capacity.reservedFragments} / {capacity.fragmentLimit} 片段
+              {capacity.waitingSessions > 0 ? ` · ${capacity.waitingSessions} 个容量等待` : ""}
+            </span>
+          ))}
+        </div>
+      ) : null}
+      {index.isError ? <p className="panel-error">容量读取失败：{index.error.message}</p> : null}
       <div className="content-panel">
         <div className="panel-heading">
           <span>Session 台账</span>
-          <button className="icon-button" disabled={sessions.isFetching} onClick={() => void sessions.refetch()} type="button">
+          <button className="icon-button" disabled={sessions.isFetching} onClick={() => { void sessions.refetch(); void index.refetch(); }} type="button">
             <RotateCcw aria-hidden="true" size={14} />
             刷新
           </button>
@@ -152,8 +161,8 @@ export function SessionsPage() {
                   <div className="session-state">
                     <span className={`state-mark state-${session.disposition}`} />
                     <div>
-                      <strong>{dispositionLabels[session.disposition]}</strong>
-                      <span>{statusLabels[session.indexStatus]}</span>
+                      <strong>{session.admissionReason === "capacity" ? "容量等待" : session.admissionReason === "oversized" ? "超过片段预算" : dispositionLabels[session.disposition]}</strong>
+                      <span>{session.admissionReason === "capacity" ? "等待片段容量" : session.admissionReason === "oversized" ? "单个 Session 超过 Agent 总预算" : statusLabels[session.indexStatus]}</span>
                     </div>
                   </div>
                   <Link
@@ -173,7 +182,7 @@ export function SessionsPage() {
                     <button
                       aria-label={`${action.label} ${title}`}
                       className={action.operation === "exclude" ? "text-button danger-button" : "text-button"}
-                      disabled={pending || session.indexStatus === "source_unavailable"}
+                      disabled={pending || (action.operation === "restore" && session.indexStatus === "source_unavailable")}
                       onClick={() => mutation.mutate({ candidateId: session.candidateId, operation: action.operation })}
                       type="button"
                     >

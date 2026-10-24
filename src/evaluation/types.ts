@@ -68,6 +68,12 @@ const chunkAblationSchema = z.object({
 });
 
 export const evaluationConfigSchema = z.object({
+  codex: z.object({
+    command: z.string().min(1).default("codex"),
+    homeDirectory: absolutePath.optional(),
+    reasoningEffort: z.enum(["low", "medium", "high", "xhigh", "max"]).default("high"),
+    timeoutMs: z.number().int().positive().default(180_000),
+  }).optional(),
   benchmark: z.object({
     allowUnjudgedResults: z.boolean().optional(),
     embeddingCacheDirectory: absolutePath.optional(),
@@ -100,6 +106,7 @@ export const evaluationConfigSchema = z.object({
     queryLimit: z.number().int().positive().optional(),
   }).optional(),
   qrelReview: z.object({
+    transport: z.enum(["openai", "codex"]).default("openai"),
     apiKeyEnv: z.string().min(1).default("DEEPSEEK_API_KEY"),
     apiKeyFile: absolutePath.optional(),
     baseUrl: z.url().default("https://api.deepseek.com"),
@@ -110,9 +117,10 @@ export const evaluationConfigSchema = z.object({
     relevanceThreshold: z.number().int().min(1).max(3).default(2),
   }).optional(),
   queryGeneration: z.object({
+    transport: z.enum(["openai", "codex"]).default("openai"),
     apiKeyEnv: z.string().min(1).default("OPENAI_API_KEY"),
     apiKeyFile: absolutePath.optional(),
-    baseUrl: z.url(),
+    baseUrl: z.url().optional(),
     datasetIds: z.array(datasetId).min(1),
     maxQueries: z.number().int().positive().default(200),
     model: z.string().min(1),
@@ -126,6 +134,9 @@ export const evaluationConfigSchema = z.object({
   }).optional(),
   schemaVersion: z.literal(1),
 }).superRefine((config, context) => {
+  if (config.queryGeneration?.transport === "openai" && !config.queryGeneration.baseUrl) {
+    context.addIssue({ code: "custom", message: "API query generation requires baseUrl", path: ["queryGeneration", "baseUrl"] });
+  }
   const configuredIds = new Set(config.datasets.map((dataset) => dataset.id));
   config.qrelReview?.datasetIds.forEach((id, index) => {
     if (!configuredIds.has(id)) context.addIssue({ code: "custom", message: `unknown qrel-review dataset: ${id}`, path: ["qrelReview", "datasetIds", index] });
@@ -262,6 +273,8 @@ const humanReviewerSchema = z.object({
 });
 
 const llmReviewerSchema = z.object({
+  reasoningEffort: z.string().optional(),
+  instructionsSha256: z.string().optional(),
   model: z.string().min(1),
   promptVersion: z.number().int().positive(),
   provider: z.string().min(1),

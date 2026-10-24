@@ -75,7 +75,7 @@ describe("MCP source tools", () => {
     await client.callTool({ name: "index_session", arguments: { candidateId } });
     const searched = await client.callTool({
       name: "search_fragments",
-      arguments: { query: "source provenance", sourceType: "session" },
+      arguments: { excludeAgent: "claude-code", query: "source provenance", sourceType: "session" },
     });
     const result = (searched.structuredContent as { results: Array<{ sourcePath: string; matchReason: string; score: number }> }).results[0];
     expect(result?.sourcePath).toBe(sessionPath);
@@ -83,10 +83,22 @@ describe("MCP source tools", () => {
     expect(result?.score).toBeCloseTo(2 / 61);
     const semantic = await client.callTool({
       name: "search_fragments",
-      arguments: { mode: "semantic", query: "locate historical evidence", sourceType: "session" },
+      arguments: { excludeAgent: "claude-code", mode: "semantic", query: "locate historical evidence", sourceType: "session" },
     });
     expect((semantic.structuredContent as { results: Array<{ matchReason: string; sourcePath: string }> }).results[0])
       .toMatchObject({ matchReason: "semantic similarity", sourcePath: sessionPath });
+
+    for (const excludeAgent of ["claude-code", "codex", "cursor", "opencode"] as const) {
+      const filtered = await client.callTool({
+        name: "search_fragments", arguments: { excludeAgent, query: "source provenance" },
+      });
+      expect(filtered.isError).not.toBe(true);
+      expect((filtered.structuredContent as { results: unknown[] }).results).toHaveLength(excludeAgent === "codex" ? 0 : 1);
+    }
+    for (const arguments_ of [{ query: "source provenance" }, { excludeAgent: "claude", query: "source provenance" }]) {
+      const invalid = await client.callTool({ name: "search_fragments", arguments: arguments_ });
+      expect(invalid.isError).toBe(true);
+    }
 
     await client.close();
     await server.close();

@@ -1,6 +1,8 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import type { FastifyBaseLogger } from "fastify";
+
 import { buildServer } from "./app.js";
 import { acquireInstanceLock, DaemonAlreadyRunningError, readInstanceLock } from "./instance-lock.js";
 import { getDataDirectory, isLoopbackHost } from "./paths.js";
@@ -17,6 +19,7 @@ export interface StartServerOptions {
   dataDirectory?: string;
   host: string;
   homeDirectory?: string;
+  loggerInstance?: FastifyBaseLogger;
   port: number;
   scanIntervalMs?: number;
   writeLogs?: boolean;
@@ -50,9 +53,11 @@ export async function startServer(options: StartServerOptions): Promise<StartSer
   let app;
   try {
     app = await buildServer({
+      backgroundInitialScan: true,
       dataDirectory,
       homeDirectory: options.homeDirectory,
       instanceToken: instanceLock.token,
+      loggerInstance: options.loggerInstance,
       logFile: options.writeLogs ? daemonLogPath : undefined,
       publicDirectory: path.resolve(moduleDirectory, "../public"),
       scanIntervalMs: options.scanIntervalMs,

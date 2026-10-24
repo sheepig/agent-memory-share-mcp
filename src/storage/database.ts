@@ -128,6 +128,41 @@ const migrations = [
     ALTER TABLE fragments ADD COLUMN chunk_index INTEGER;
     ALTER TABLE fragments ADD COLUMN content_tokens INTEGER CHECK (content_tokens IS NULL OR content_tokens >= 0);
   `,
+  `
+    ALTER TABLE sources ADD COLUMN session_fragment_count INTEGER;
+    ALTER TABLE sources ADD COLUMN admission_reason TEXT CHECK (admission_reason IN ('capacity', 'oversized'));
+    ALTER TABLE sources ADD COLUMN retry_after TEXT;
+    ALTER TABLE fragments ADD COLUMN embedding_input_hash TEXT;
+    ALTER TABLE fragments ADD COLUMN search_rowid INTEGER;
+    UPDATE fragments SET search_rowid = fts.rowid FROM fragment_search AS fts WHERE fts.fragment_id = fragments.id;
+    UPDATE fragments SET embedding_input_hash = (SELECT input_hash FROM fragment_embeddings WHERE fragment_id = fragments.id);
+    CREATE TABLE source_discovery_cache (
+      adapter_key TEXT NOT NULL,
+      source_path TEXT NOT NULL,
+      byte_size INTEGER NOT NULL,
+      modified_ms REAL NOT NULL,
+      rule_version TEXT NOT NULL,
+      checked_at INTEGER NOT NULL,
+      reference_json TEXT,
+      PRIMARY KEY (adapter_key, source_path)
+    );
+    CREATE INDEX sources_pending_work ON sources(disposition, processing_state, source_updated_at DESC, id);
+    CREATE INDEX sources_path ON sources(source_path);
+    CREATE INDEX sources_session_capacity ON sources(agent, source_type, disposition, source_updated_at DESC, id ASC);
+    CREATE INDEX sources_reconsider ON sources(agent, source_type, source_updated_at DESC, id ASC);
+    CREATE TABLE session_fragment_usage (agent TEXT PRIMARY KEY, fragments INTEGER NOT NULL);
+    INSERT INTO session_fragment_usage SELECT s.agent, count(*) FROM fragments f JOIN sources s ON s.id = f.source_id
+      WHERE s.source_type = 'session' GROUP BY s.agent;
+    CREATE TRIGGER session_fragment_added AFTER INSERT ON fragments BEGIN
+      INSERT INTO session_fragment_usage(agent, fragments)
+        SELECT agent, 1 FROM sources WHERE id = NEW.source_id AND source_type = 'session'
+        ON CONFLICT(agent) DO UPDATE SET fragments = fragments + 1;
+    END;
+    CREATE TRIGGER session_fragment_removed AFTER DELETE ON fragments BEGIN
+      UPDATE session_fragment_usage SET fragments = fragments - 1
+        WHERE agent = (SELECT agent FROM sources WHERE id = OLD.source_id AND source_type = 'session');
+    END;
+  `,
 ] as const;
 
 export type AppDatabase = Database.Database;

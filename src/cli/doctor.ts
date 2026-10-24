@@ -1,10 +1,10 @@
 import fs from "node:fs";
-import path from "node:path";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
 import type { LocalApiClient } from "../client/local-api.js";
+import { resolveDesktopSourcePaths, type DesktopSourcePaths } from "../sources/source-paths.js";
 import { APP_VERSION } from "../version.js";
 import { inspectAgentIntegration, type SupportedAgent } from "./agent-integration.js";
 
@@ -20,6 +20,7 @@ export async function runDoctor(options: {
   api: LocalApiClient;
   homeDirectory: string;
   mcpUrl: string;
+  sources?: DesktopSourcePaths;
 }): Promise<{ checks: DoctorCheck[]; ok: boolean }> {
   const checks: DoctorCheck[] = [];
   try {
@@ -51,14 +52,16 @@ export async function runDoctor(options: {
   } catch (error) {
     checks.push({ detail: error instanceof Error ? error.message : String(error), name: "index", status: "fail" });
   }
+  const sourcePaths = resolveDesktopSourcePaths(options.homeDirectory, options.sources);
   const roots = [
-    ".codex/sessions",
-    ".codex/memories",
-    ".claude/projects",
-    ".cursor/projects",
-    ".local/share/opencode/opencode.db",
+    ...sourcePaths.codex.sessionRoots,
+    ...sourcePaths.codex.memoryRoots,
+    ...sourcePaths["claude-code"].projectRoots,
+    ...(sourcePaths["claude-code"].memoryRoots ?? []),
+    ...sourcePaths.cursor.sessionRoots,
+    sourcePaths.opencode.databasePath,
   ];
-  const availableRoots = roots.filter((root) => fs.existsSync(path.join(options.homeDirectory, root)));
+  const availableRoots = [...new Set(roots)].filter((root) => fs.existsSync(root));
   checks.push({
     detail: availableRoots.length > 0 ? availableRoots.join(", ") : "No supported source locations found.",
     name: "source-locations",

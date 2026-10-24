@@ -21,6 +21,7 @@ describe("database migrations", () => {
     const old = new Database(file);
     old.exec(`
       CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+      CREATE VIRTUAL TABLE fragment_search USING fts5(fragment_id UNINDEXED, title_terms, body_terms, tokenize='unicode61');
       INSERT INTO schema_migrations VALUES(2, '2026-01-01T00:00:00.000Z');
       CREATE TABLE scan_diagnostics(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -74,6 +75,7 @@ describe("database migrations", () => {
       { version: 8 },
       { version: 9 },
       { version: 10 },
+      { version: 11 },
     ]);
     const fragmentColumns = database.prepare("PRAGMA table_info(fragments)").all() as Array<{ name: string }>;
     expect(fragmentColumns.map((column) => column.name)).toEqual(expect.arrayContaining([

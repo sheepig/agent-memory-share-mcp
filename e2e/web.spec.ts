@@ -194,7 +194,7 @@ test.afterAll(async () => {
   await fs.rm(temporaryRoot, { force: true, recursive: true });
 });
 
-test("selects a session and finds its indexed evidence", async ({ page }, testInfo) => {
+test("automatically indexes a session and applies exclusion and restoration", async ({ page }, testInfo) => {
   await page.goto(`${baseUrl}/sessions`);
 
   const session = page.locator(".session-row", { hasText: "Search provenance" });
@@ -206,8 +206,18 @@ test("selects a session and finds its indexed evidence", async ({ page }, testIn
   await page.getByRole("link", { name: "返回 Sessions" }).click();
 
   const returnedSession = page.locator(".session-row", { hasText: "Search provenance" });
-  await returnedSession.getByRole("button", { name: "参与索引 Search provenance" }).click();
+  await expect(returnedSession).toContainText("已参与", { timeout: 15_000 });
+  await expect(returnedSession).toContainText("索引可用");
+  await expect(page.getByLabel("Agent Session 片段容量")).toContainText("Codex：1 / 5000 片段");
+
+  await returnedSession.getByRole("button", { name: "剔除 Search provenance" }).click();
+  await expect(returnedSession).toContainText("已剔除");
+  const excludedSearch = await page.request.get(`${baseUrl}/api/search`, { params: { mode: "keyword", query: "evidence location" } });
+  expect(excludedSearch.ok()).toBe(true);
+  expect((await excludedSearch.json()).results).toEqual([]);
+  await returnedSession.getByRole("button", { name: "恢复 Search provenance" }).click();
   await expect(returnedSession).toContainText("已参与");
+  await expect(returnedSession).toContainText("索引可用");
 
   await page.getByRole("link", { exact: true, name: "Search" }).click();
   await page.getByRole("combobox", { name: "检索模式" }).selectOption("hybrid");

@@ -1,9 +1,9 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 import fastifyStatic from "@fastify/static";
 import Fastify, { type FastifyBaseLogger, type FastifyInstance, type FastifyServerOptions } from "fastify";
-import pino from "pino";
 import { z, ZodError } from "zod";
 
 import { getHealth } from "../application/get-health.js";
@@ -13,15 +13,18 @@ import { SourceNotFoundError, SourceUnavailableError } from "../domain/source.js
 import { registerMcpHttp } from "../mcp/register-http.js";
 import { LocalEmbeddingProvider, type EmbeddingProvider } from "../search/embedding.js";
 import { LocalRerankerProvider, type RerankerProvider } from "../search/reranker.js";
+import { createDesktopAdapters } from "../sources/desktop-sources.js";
 import { openDatabase } from "../storage/database.js";
 import { initializeDaemonConfig, readSearchSettings, updateSearchSettings } from "./config.js";
-import { RotatingLogStream } from "./rotating-log.js";
+import { createFileLogger } from "./file-logger.js";
 import { createSourceWorker } from "./source-worker.js";
 
 export interface BuildServerOptions {
+  backgroundInitialScan?: boolean;
   dataDirectory: string;
   embeddingProvider?: EmbeddingProvider;
   logger?: boolean;
+  loggerInstance?: FastifyBaseLogger;
   logFile?: string;
   homeDirectory?: string;
   instanceToken?: string;
@@ -43,19 +46,24 @@ export async function buildServer(options: BuildServerOptions): Promise<FastifyI
       },
     },
   };
-  const fastifyOptions: FastifyServerOptions = options.logFile
-    ? { loggerInstance: pino(loggerOptions, new RotatingLogStream(options.logFile)) as unknown as FastifyBaseLogger }
+  const fileLogger = !options.loggerInstance && options.logFile ? await createFileLogger(options.logFile) : undefined;
+  const loggerInstance = options.loggerInstance ?? fileLogger?.logger;
+  const fastifyOptions: FastifyServerOptions = loggerInstance
+    ? { loggerInstance }
     : { logger: options.logger === false ? false : loggerOptions };
   const app = Fastify(fastifyOptions);
-  initializeDaemonConfig(options.dataDirectory);
+  app.addHook("onClose", async () => { await fileLogger?.close(); });
+  const config = initializeDaemonConfig(options.dataDirectory);
   const database = openDatabase(options.dataDirectory);
   const embeddingProvider = options.embeddingProvider ?? new LocalEmbeddingProvider(path.join(options.dataDirectory, "models"));
   const reranker = options.rerankerProvider ?? new LocalRerankerProvider(path.join(options.dataDirectory, "models"));
   const sources = createSourceService(database, {
+    adapters: createDesktopAdapters(options.homeDirectory ?? os.homedir(), embeddingProvider, config.sources),
     embeddingProvider,
     homeDirectory: options.homeDirectory,
     isRerankerEnabled: () => readSearchSettings(options.dataDirectory).rerankerEnabled,
     reranker,
+    sessionFragmentLimits: config.sessionFragmentLimits,
   });
   const worker = createSourceWorker(sources, { intervalMs: options.scanIntervalMs });
 
@@ -64,7 +72,7 @@ export async function buildServer(options: BuildServerOptions): Promise<FastifyI
     try {
       await reranker.dispose?.();
     } finally {
-      database.close();
+      try { await embeddingProvider.dispose?.(); } finally { database.close(); }
     }
   });
 
@@ -116,6 +124,7 @@ export async function buildServer(options: BuildServerOptions): Promise<FastifyI
   app.get("/api/search", async (request) => {
     const query = z.object({
       agent: z.enum(["claude-code", "codex", "cursor", "opencode"]).optional(),
+      excludeAgent: z.enum(["claude-code", "codex", "cursor", "opencode"]).optional(),
       contextProjectPath: z.string().max(4_096).optional(),
       limit: z.coerce.number().int().min(1).max(100).default(20),
       mode: z.enum(["hybrid", "keyword", "semantic"]).default("keyword"),
@@ -152,11 +161,19 @@ export async function buildServer(options: BuildServerOptions): Promise<FastifyI
     app.get("/memories", async (_request, reply) => reply.redirect("/search"));
   }
 
-  try {
-    await worker.start();
-  } catch (error) {
-    await app.close();
-    throw error;
+  if (options.backgroundInitialScan) {
+    app.addHook("onListen", async () => {
+      void worker.start().catch(() => {
+        app.log.error("Initial source scan failed. Check /api/scan/status and retry with agent-memory scan.");
+      });
+    });
+  } else {
+    try {
+      await worker.start();
+    } catch (error) {
+      await app.close();
+      throw error;
+    }
   }
   return app;
 }

@@ -14,6 +14,7 @@ const healthSchema = z.object({
 export type Health = z.infer<typeof healthSchema>;
 
 const sessionSchema = z.object({
+  admissionReason: z.enum(["capacity", "oversized"]).optional(),
   agent: agentSchema,
   candidateId: z.string(),
   disposition: z.enum(["discovered", "excluded", "selected"]),
@@ -68,6 +69,8 @@ const searchResultSchema = z.object({
 
 const searchResultsSchema = z.object({ results: z.array(searchResultSchema) });
 const indexedSessionSchema = z.object({
+  admissionReason: z.enum(["capacity", "oversized"]).optional(),
+  disposition: z.enum(["discovered", "selected"]).optional(),
   candidateId: z.string(),
   fragmentCount: z.number().int().nonnegative(),
   sourcePath: z.string(),
@@ -82,12 +85,20 @@ export type SessionCandidate = z.infer<typeof sessionSchema>;
 export type SessionConversation = z.infer<typeof sessionConversationSchema>;
 export type SearchResult = z.infer<typeof searchResultSchema>;
 
+const sessionCapacitySchema = z.object({
+  fragmentLimit: z.number().int().positive(),
+  fragments: z.number().int().nonnegative(),
+  reservedFragments: z.number().int().nonnegative(),
+  selectedSessions: z.number().int().nonnegative(),
+  waitingSessions: z.number().int().nonnegative(),
+});
 const indexStatusSchema = z.object({
   activeScanCheckpoints: z.number().int().nonnegative(),
   embedding: z.record(z.string(), z.number().int().nonnegative()),
   embeddingModelId: z.string().optional(),
   fragments: z.number().int().nonnegative(),
   processing: z.record(z.string(), z.number().int().nonnegative()),
+  sessionCapacity: z.record(agentSchema, sessionCapacitySchema).optional(),
 });
 
 async function requestJson<T>(url: string, schema: z.ZodType<T>, init?: RequestInit): Promise<T> {

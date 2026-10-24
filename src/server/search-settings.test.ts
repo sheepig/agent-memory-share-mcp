@@ -57,7 +57,7 @@ describe("persisted search settings", () => {
 
       const mcp = await app.inject({ method: "POST", url: "/mcp",
         headers: { accept: "application/json, text/event-stream" },
-        payload: { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "search_fragments", arguments: { query: "evidence" } } },
+        payload: { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "search_fragments", arguments: { excludeAgent: "claude-code", query: "evidence" } } },
       });
       expect(mcp.statusCode).toBe(200);
       expect(mcp.body).toContain("settings-reranker");

@@ -1,11 +1,13 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { createHash } from "node:crypto";
 
 import OpenAI from "openai";
 import { z } from "zod";
 
 import { readCandidatePool, readQueryCandidates, writeQueryCandidates } from "./files.js";
 import { evaluationHash } from "./identity.js";
+import { assertSafeModelOutput, CodexEvaluationModel } from "./codex-model.js";
 import type { CandidatePool, EvaluationConfig, QueryCandidate } from "./types.js";
 
 export const QREL_REVIEW_PROMPT_VERSION = 1;
@@ -48,15 +50,19 @@ async function concurrentMap<T, U>(
 ): Promise<U[]> {
   const results = new Array<U>(values.length);
   let nextIndex = 0;
+  let failure: unknown;
   async function worker(): Promise<void> {
     for (;;) {
+      if (failure) return;
       const index = nextIndex;
       nextIndex += 1;
       if (index >= values.length) return;
-      results[index] = await mapper(values[index]!, index);
+      try { results[index] = await mapper(values[index]!, index); }
+      catch (error) { failure = error; return; }
     }
   }
   await Promise.all(Array.from({ length: Math.min(concurrency, values.length) }, () => worker()));
+  if (failure) throw failure;
   return results;
 }
 
@@ -97,13 +103,15 @@ async function judgeResult(
   }
 }
 
-function existingReviewMatches(candidate: QueryCandidate, config: QrelReviewConfig, pool: CandidatePool): boolean {
+function existingReviewMatches(candidate: QueryCandidate, config: QrelReviewConfig, pool: CandidatePool, instructions: string, effort?: string): boolean {
   const reviewer = candidate.review.reviewer;
   return candidate.review.completeness === "complete"
     && typeof reviewer === "object"
     && reviewer.type === "llm"
     && reviewer.model === config.model
-    && reviewer.provider === config.provider
+    && reviewer.provider === (config.transport === "codex" ? "codex" : config.provider)
+    && reviewer.reasoningEffort === effort
+    && reviewer.instructionsSha256 === createHash("sha256").update(instructions).digest("hex")
     && reviewer.promptVersion === QREL_REVIEW_PROMPT_VERSION
     && reviewer.relevanceThreshold === config.relevanceThreshold
     && candidate.review.scope?.type === "pooled"
@@ -153,86 +161,99 @@ export async function reviewQrelsWithLlm(
   }
   const previousById = new Map(previous.map((candidate) => [candidate.candidateId, candidate]));
   const completed = new Map<string, QueryCandidate>();
-  const apiKey = await apiKeyFor(reviewConfig);
-  const client = new OpenAI({
-    apiKey,
+  const codex = reviewConfig.transport === "codex" ? new CodexEvaluationModel(config) : undefined;
+  const effort = codex ? config.codex?.reasoningEffort ?? "high" : undefined;
+  const client = codex ? undefined : new OpenAI({
+    apiKey: await apiKeyFor(reviewConfig),
     baseURL: reviewConfig.baseUrl,
     ...(dependencies.fetch ? { fetch: dependencies.fetch } : {}),
     maxRetries: 4,
     timeout: 120_000,
   });
 
-  for (const candidate of candidates) {
-    if (!allowedDatasets.has(candidate.datasetId)) {
-      completed.set(candidate.candidateId, candidate);
-      continue;
-    }
-    if (candidate.queryQuality?.status === "rejected") {
-      completed.set(candidate.candidateId, candidate);
-      continue;
-    }
-    const prior = previousById.get(candidate.candidateId);
-    if (prior && prior.datasetId === candidate.datasetId && prior.query === candidate.query
-      && existingReviewMatches(prior, reviewConfig, pool)) {
-      completed.set(candidate.candidateId, prior);
-      continue;
-    }
-    const pooled = poolByCandidate.get(candidate.candidateId);
-    if (!pooled) throw new Error(`Candidate pool is missing candidate: ${candidate.candidateId}`);
-    if (pooled.datasetId !== candidate.datasetId || pooled.query !== candidate.query) {
-      throw new Error(`Candidate pool does not match query candidate: ${candidate.candidateId}`);
-    }
-    const judgments = await concurrentMap(pooled.results, reviewConfig.concurrency, async (result) => ({
-      result,
-      value: await judgeResult(client, reviewConfig, instructions, candidate.query, result),
-    }));
-    const relevant = judgments.filter(({ value }) => value.relevance >= reviewConfig.relevanceThreshold);
-    const reportedModels = [...new Set(judgments.map(({ value }) => value.model))].sort();
-    const reviewed: QueryCandidate = {
-      ...candidate,
-      goldSpans: relevant.length > 0 ? relevant.map(({ result }) => goldSpan(result)) : candidate.goldSpans,
-      review: {
-        completeness: "complete",
-        judgments: judgments.map(({ result, value }) => ({
-          ...(result.chunkIndex !== undefined ? { chunkIndex: result.chunkIndex } : {}),
-          endLine: lineNumber(result.endLocation ?? result.location),
-          ...(result.passageId ? { passageId: result.passageId } : {}),
-          reason: value.reason,
-          relevance: value.relevance,
-          sessionId: result.sessionId,
-          startLine: lineNumber(result.location),
-        })),
-        reviewedAt: new Date().toISOString(),
-        reviewer: {
-          model: reviewConfig.model,
-          promptVersion: QREL_REVIEW_PROMPT_VERSION,
-          provider: reviewConfig.provider,
-          relevanceThreshold: reviewConfig.relevanceThreshold,
-          reportedModels,
-          type: "llm",
+  try {
+    for (const candidate of candidates) {
+      if (!allowedDatasets.has(candidate.datasetId)) {
+        completed.set(candidate.candidateId, candidate);
+        continue;
+      }
+      if (candidate.queryQuality?.status === "rejected") {
+        completed.set(candidate.candidateId, candidate);
+        continue;
+      }
+      const prior = previousById.get(candidate.candidateId);
+      if (prior && prior.datasetId === candidate.datasetId && prior.query === candidate.query
+        && existingReviewMatches(prior, reviewConfig, pool, instructions, effort)) {
+        completed.set(candidate.candidateId, prior);
+        continue;
+      }
+      const pooled = poolByCandidate.get(candidate.candidateId);
+      if (!pooled) throw new Error(`Candidate pool is missing candidate: ${candidate.candidateId}`);
+      if (pooled.datasetId !== candidate.datasetId || pooled.query !== candidate.query) {
+        throw new Error(`Candidate pool does not match query candidate: ${candidate.candidateId}`);
+      }
+      const judgments = await concurrentMap(pooled.results, reviewConfig.concurrency, async (result) => {
+        assertSafeModelOutput(result.text);
+        assertSafeModelOutput(candidate.query);
+        const response = codex
+          ? await codex.json(reviewConfig.model, instructions, JSON.stringify({ passage: result.text, query: candidate.query }), judgeResponseSchema)
+          : undefined;
+        const value = response
+          ? { ...judgeResponseSchema.parse(response.data), model: response.model }
+          : await judgeResult(client!, reviewConfig, instructions, candidate.query, result);
+        assertSafeModelOutput(value.reason);
+        return { result, value };
+      });
+      const relevant = judgments.filter(({ value }) => value.relevance >= reviewConfig.relevanceThreshold);
+      const reportedModels = [...new Set(judgments.map(({ value }) => value.model))].sort();
+      const reviewed: QueryCandidate = {
+        ...candidate,
+        goldSpans: relevant.length > 0 ? relevant.map(({ result }) => goldSpan(result)) : candidate.goldSpans,
+        review: {
+          completeness: "complete",
+          judgments: judgments.map(({ result, value }) => ({
+            ...(result.chunkIndex !== undefined ? { chunkIndex: result.chunkIndex } : {}),
+            endLine: lineNumber(result.endLocation ?? result.location),
+            ...(result.passageId ? { passageId: result.passageId } : {}),
+            reason: value.reason,
+            relevance: value.relevance,
+            sessionId: result.sessionId,
+            startLine: lineNumber(result.location),
+          })),
+          reviewedAt: new Date().toISOString(),
+          reviewer: {
+            model: reviewConfig.model,
+            promptVersion: QREL_REVIEW_PROMPT_VERSION,
+            provider: codex ? "codex" : reviewConfig.provider,
+            ...(effort ? { reasoningEffort: effort } : {}),
+            instructionsSha256: createHash("sha256").update(instructions).digest("hex"),
+            relevanceThreshold: reviewConfig.relevanceThreshold,
+            reportedModels,
+            type: "llm",
+          },
+          scope: {
+            depth: pool.depth,
+            modes: pool.modes,
+            poolGeneratedAt: pool.generatedAt,
+            ...(pool.chunkAblation ? { poolSha256: evaluationHash(pool) } : {}),
+            type: "pooled",
+          },
+          status: relevant.length > 0 ? "accepted" : "rejected",
         },
-        scope: {
-          depth: pool.depth,
-          modes: pool.modes,
-          poolGeneratedAt: pool.generatedAt,
-          ...(pool.chunkAblation ? { poolSha256: evaluationHash(pool) } : {}),
-          type: "pooled",
-        },
-        status: relevant.length > 0 ? "accepted" : "rejected",
-      },
-    };
-    completed.set(candidate.candidateId, reviewed);
-    await writeQueryCandidates(outputFile, candidates.map((value) => completed.get(value.candidateId) ?? value));
-  }
+      };
+      completed.set(candidate.candidateId, reviewed);
+      await writeQueryCandidates(outputFile, candidates.map((value) => completed.get(value.candidateId) ?? value));
+    }
 
-  const output = candidates.map((candidate) => completed.get(candidate.candidateId) ?? candidate);
-  await writeQueryCandidates(outputFile, output);
-  const reviewed = output.filter((candidate) => allowedDatasets.has(candidate.datasetId)
-    && candidate.queryQuality?.status !== "rejected" && candidate.review.completeness === "complete");
-  return {
-    accepted: reviewed.filter((candidate) => candidate.review.status === "accepted").length,
-    outputFile,
-    rejected: reviewed.filter((candidate) => candidate.review.status === "rejected").length,
-    reviewed: reviewed.length,
-  };
+    const output = candidates.map((candidate) => completed.get(candidate.candidateId) ?? candidate);
+    await writeQueryCandidates(outputFile, output);
+    const reviewed = output.filter((candidate) => allowedDatasets.has(candidate.datasetId)
+      && candidate.queryQuality?.status !== "rejected" && candidate.review.completeness === "complete");
+    return {
+      accepted: reviewed.filter((candidate) => candidate.review.status === "accepted").length,
+      outputFile,
+      rejected: reviewed.filter((candidate) => candidate.review.status === "rejected").length,
+      reviewed: reviewed.length,
+    };
+  } finally { await codex?.close(); }
 }
